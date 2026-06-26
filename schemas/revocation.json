@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rave.maccrab.com/schemas/revocation.json",
+  "title": "MacCrab Rave Revocation List (v0)",
+  "description": "Schema for rave/revocations.json. Per plan §12. The list is Ed25519-signed by the offline catalog key (detached revocations.json.sig verified against catalog.pub); client tools verify the signature before consuming.",
+  "type": "object",
+  "required": ["version", "updated_at", "revocations"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string",
+      "const": "0",
+      "description": "Schema version. Bumped only on breaking changes."
+    },
+    "serial": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic revocation-list serial. Monotonic-increment rule: every change to `revocations` (or any other field) MUST increment serial by +1, and serial MUST never decrease across two validly-signed revocations.json the client observes. Because revocations.json is Ed25519-signed, this is a SIGNED counter: a client that has seen serial N MUST reject any later-fetched, validly-signed list whose serial < N as a stale/rollback (replay) attack that would silently un-revoke a compromised plugin; a network attacker cannot forge a higher serial without the offline catalog key. Bound into the client's provenance receipt so a run can prove which revocation state was in effect — answering 'was it revoked when I ran it?' offline, forever (PLATFORM-VISION keystone). Distinct from `version` (the format version). REQUIRED going forward: /api/admin/revoke.js always emits an incremented serial; kept out of `required` here only so the pre-ceremony signed revocations.json (which predates this field) still validates. Promote to `required` in the same commit that lands the re-signed revocations.json."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp of the last update. Operators check this against the staleness thresholds in plan §3.9 (warning >30 days, critical >90 days)."
+    },
+    "revocations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Revocation" },
+      "description": "List of revoked plugin versions. Operators with affected versions installed receive a hot-uninstall instruction at next install/update check."
+    }
+  },
+  "$defs": {
+    "Revocation": {
+      "type": "object",
+      "required": ["plugin_id", "scope", "reason", "code", "decided_at", "decided_by"],
+      "additionalProperties": false,
+      "properties": {
+        "plugin_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$"
+        },
+        "scope": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["kind", "version"],
+              "properties": {
+                "kind": { "const": "single_version" },
+                "version": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "from_version"],
+              "properties": {
+                "kind": { "const": "version_range" },
+                "from_version": { "type": "string" },
+                "to_version": { "type": "string" }
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind"],
+              "properties": {
+                "kind": { "const": "all_versions" }
+              }
+            }
+          ],
+          "description": "Which versions of plugin_id are revoked."
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Human-readable explanation of the revocation. Operator-facing; shown in the dashboard."
+        },
+        "code": {
+          "type": "string",
+          "enum": [
+            "compromise",
+            "supply_chain_incident",
+            "malicious_intent",
+            "critical_bug_user_impact",
+            "policy_violation",
+            "author_request",
+            "abuse_pattern"
+          ]
+        },
+        "advisory_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Optional link to a public security advisory (GitHub Security Advisories, CVE entry, etc.)."
+        },
+        "decided_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decided_by": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "GitHub logins of maintainers who decided the revocation. Multi-maintainer governance (plan §13.2) requires at least 2 signers for high-impact revocations; v0 with solo maintainer is single-signer with warning."
+        },
+        "affected_signing_identity": {
+          "type": "object",
+          "properties": {
+            "workflow_ref": { "type": "string" },
+            "run_id": { "type": "string" }
+          },
+          "description": "If revocation is keyed on a specific signing event (e.g., exfiltrated workflow OIDC token), record the exact identity. Operators may have other versions from a different signing event that remain valid."
+        }
+      }
+    }
+  }
+}

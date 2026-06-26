@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+verify-release-artifacts — fail-closed coverage check for the served release
+bundles under rave/releases/.
+
+verify-catalog-signatures proves the catalog/kit/revocation JSON is signed; it
+does NOT look at the binary .zip bundles that build.sh mirrors into the deployed
+site and that catalog entries' release_url_template points at
+(https://rave.maccrab.com/releases/{tag}/{file}). Those bytes ARE the install-
+download surface. This gate closes that gap: every file served from releases/
+must EITHER
+
+  (a) hash to an artifact_sha256 pinned in a signed catalog/*.json version, or
+  (b) be an explicitly-listed pre-launch rehearsal fixture (REHEARSAL_FIXTURES).
+
+Anything else — a binary that would be served from rave.maccrab.com with no
+signed catalog entry pinning its SHA-256 — FAILS CLOSED and blocks the build.
+
+Today every artifact_sha256 is an all-zero placeholder (pre-ceremony), so the
+only served file is the rehearsal fixture, which is excluded with a loud warning.
+Once the keyholder stamps real hashes and cuts real binaries, served bundles
+match (a) and any stray/unpinned artifact is caught.
+
+Usage:
+    rave/tools/verify-release-artifacts                 # checks the rave/ tree
+    rave/tools/verify-release-artifacts --rave-dir path/to/rave
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+# Pre-launch rehearsal artifacts that are git-tracked + served but intentionally
+# have no catalog entry. They MUST be removed before GA (they are not installable
+# — no entry references them — but they should not ship). Listed explicitly so a
+# NEW unpinned artifact can never hide among them. Paths are relative to releases/.
+REHEARSAL_FIXTURES = {
+    "v0.1.0/com.maccrab.hosts-collector.zip",
+}
+
+ZERO_SHA256 = "0" * 64
+
+
+def _is_real_sha256(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    v = value.strip().lower()
+    if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+        return False
+    return v != ZERO_SHA256
+
+
+def pinned_artifact_hashes(rave: Path) -> set[str]:
+    """Every real (present, non-all-zero) artifact_sha256 across signed entries."""
+    pinned: set[str] = set()
+    for f in sorted((rave / "catalog").glob("*.json")):
+        try:
+            entry = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue  # signature/schema gates own malformed entries.
+        versions = entry.get("versions")
+        if not isinstance(versions, dict):
+            continue
+        for ver in versions.values():
+            if isinstance(ver, dict) and _is_real_sha256(ver.get("artifact_sha256")):
+                pinned.add(ver["artifact_sha256"].strip().lower())
+    return pinned
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rave-dir", default=str(Path(__file__).resolve().parent.parent),
+                    help="path to the rave/ tree (default: parent of this tool's dir)")
+    args = ap.parse_args()
+    rave = Path(args.rave_dir).resolve()
+
+    releases = rave / "releases"
+    if not releases.is_dir():
+        print("verify-release-artifacts: no releases/ dir — nothing served, OK")
+        return 0
+
+    pinned = pinned_artifact_hashes(rave)
+    served = sorted(p for p in releases.rglob("*") if p.is_file())
+
+    ok = excluded = fail = 0
+    for p in served:
+        rel = p.relative_to(releases).as_posix()
+        sha = hashlib.sha256(p.read_bytes()).hexdigest()
+        if sha in pinned:
+            ok += 1
+            continue
+        if rel in REHEARSAL_FIXTURES:
+            print(f"::warning file=rave/releases/{rel}::served rehearsal fixture "
+                  f"(no catalog entry) — excluded from the artifact gate; REMOVE before GA")
+            excluded += 1
+            continue
+        print(f"::error file=rave/releases/{rel}::served release artifact has no "
+              f"matching artifact_sha256 in any signed catalog entry (sha256={sha}) "
+              f"and is not a listed rehearsal fixture — refusing to serve unpinned bytes")
+        fail += 1
+
+    print(f"verify-release-artifacts: {len(served)} served file(s) — "
+          f"{ok} pinned, {excluded} excluded rehearsal, {fail} unpinned")
+    if fail:
+        print("::error::RELEASE-ARTIFACT GATE FAILED — a binary would be served from "
+              "rave.maccrab.com with no signed catalog entry pinning its SHA-256.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

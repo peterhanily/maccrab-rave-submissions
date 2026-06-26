@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rave.maccrab.com/schemas/catalog.json",
+  "title": "MacCrab Rave Catalog Master Index",
+  "description": "Schema for /rave/catalog.json — the master index that lists every plugin in the rave catalog with summary metadata sufficient to render a grid view without fetching per-plugin entries. Per-plugin detail lives at /rave/catalog/<id>.json (see catalog-entry.json).",
+  "type": "object",
+  "required": ["count", "plugins"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema reference for IDE autocomplete."
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Catalog index format version. Bound into the client's provenance receipt so a run records which catalog format was in effect (PLATFORM-VISION keystone). Distinct from the per-entry catalog-entry schema_version. REQUIRED going forward: tools/regenerate-catalog always emits it, so every signed catalog produced at or after the v1.19 re-sign ceremony carries it. Kept out of `required` here only so the pre-ceremony signed bytes still validate; promote to `required` in the same commit that lands the re-signed catalog.json."
+    },
+    "catalog_serial": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic freshness serial for the master index itself, incremented every time tools/regenerate-catalog rewrites catalog.json. Because catalog.json is Ed25519-signed, this is a SIGNED freshness counter: a client that has seen serial N MUST reject any later-fetched, validly-signed catalog whose catalog_serial < N as a stale-catalog (rollback/replay) attack — a network attacker cannot forge a higher serial without the offline catalog key. Pairs with `generated_at` (human/diagnostic) but, unlike a bare timestamp, is strictly ordered and signed. REQUIRED going forward (see schema_version note); emitted by tools/regenerate-catalog."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the master index was last regenerated. Useful for cache-busting + diagnostics. Not load-bearing for verification — use catalog_serial for replay/staleness ordering."
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of plugins in the index. Equals len(plugins)."
+    },
+    "plugins": {
+      "type": "object",
+      "description": "Map of plugin-id → summary. Same id pattern as catalog-entry.id.",
+      "patternProperties": {
+        "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$": {
+          "$ref": "#/$defs/PluginSummary"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "PluginSummary": {
+      "type": "object",
+      "required": ["id", "current_version", "channel", "runtime", "trust_tier", "signer_identity"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "display_name": { "type": "string", "maxLength": 60 },
+        "short_description": { "type": "string", "maxLength": 200 },
+        "current_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9-]+)?$"
+        },
+        "channel": { "type": "string", "enum": ["official", "contrib"] },
+        "runtime": { "type": "string", "enum": ["tierA", "tierB"] },
+        "trust_tier": {
+          "type": "string",
+          "enum": ["first-party", "verified-community", "unverified"]
+        },
+        "signer_identity": { "type": "string" },
+        "signer_public_key_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "First-class trust handle, surfaced from catalog-entry.signer_public_key_sha256 so the in-app grid can show + key-pin a plugin without a per-plugin round-trip. SHA-256 fingerprint of the publisher's 32-byte Ed25519 public key. REQUIRED going forward (see top-level schema_version note): emitted by tools/regenerate-catalog; kept out of `required` only so the pre-ceremony signed catalog.json still validates."
+        },
+        "kind": { "type": "string", "enum": ["collector", "analyzer"] },
+        "status": {
+          "type": "string",
+          "enum": ["active", "unreachable_temporary", "unreachable_extended", "archived", "revoked", "pre-release"]
+        },
+        "privacy_class": { "type": "string", "enum": ["metadata", "personal-comms", "content"] },
+        "requires_encrypted_scan": { "type": "boolean" },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": ["system", "browser", "comms", "activity", "artifact", "analyzer"]
+            },
+            "tags": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "min_maccrab_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "max_maccrab_version": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+            },
+            "min_macos": {
+              "type": "string",
+              "pattern": "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rave.maccrab.com/schemas/manifest.json",
+  "title": "MacCrab Plugin Manifest (v1 — platform-aligned)",
+  "description": "Schema for the manifest.json file inside a Tier B plugin's install directory. v1 (per plan v4.5) aligns with the platform's TierBManifest.swift — flat fields, no nested capabilities block. The flat-directory plugin format is <plugin-id>/{manifest.json, binary, signature, signing.key.pub}; this schema validates the manifest.json. Per plan v4.5 §3.2.",
+  "type": "object",
+  "required": ["id", "displayName", "version", "schemaVersion", "description"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema reference for IDE autocomplete."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$",
+      "description": "Reverse-DNS plugin identifier. Globally unique across the catalog. Matches the platform's PluginManifest.id constraint."
+    },
+    "displayName": {
+      "type": "string",
+      "maxLength": 80,
+      "description": "Operator-facing display name. Matches platform's TierBManifest.displayName."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9-]+)?$",
+      "description": "Semantic version. Pre-release suffix allowed."
+    },
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version. v1 == platform-aligned (post v4.5)."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 400,
+      "description": "Operator-facing description. Length-capped per plan §11 A8 (prompt-injection surface)."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["collector", "analyzer"],
+      "description": "Forensic plugin role. collector = snapshots system/app data into structured records; analyzer = cross-references already-collected records to surface patterns. Optional (kind-less v1 manifests still validate); mirrors catalog-entry.json. The app dispatches collectors to the Tier-B IPC runner (TierBIPC, protocolVersion 1); analyzer execution is deferred."
+    },
+    "fileReadSubpaths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^/.+"
+      },
+      "default": [],
+      "description": "Absolute subpaths the plugin reads. Recursive. Used by SandboxProfileBuilder.swift to populate `(allow file-read* (subpath \"...\"))` clauses in the generated SBPL profile."
+    },
+    "fileWriteSubpaths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^/.+"
+      },
+      "default": [],
+      "description": "Absolute subpaths the plugin writes. Recursive. Tier B plugins usually only write into their own vault prefix."
+    },
+    "networkConnectAllowlist": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "host:port entries the plugin may connect to. Use `*` for wildcard. Empty array = no network (SandboxProfileBuilder emits `(deny network*)`)."
+    },
+    "processExecPaths": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^/.+"
+      },
+      "default": [],
+      "description": "Absolute executable paths the plugin may spawn. Common values: /usr/bin/codesign, /usr/bin/otool for analyzers. Required when allowProcessFork=true."
+    },
+    "allowProcessFork": {
+      "type": "boolean",
+      "default": false,
+      "description": "When true, allows the plugin to call fork() / posix_spawn(). Required when processExecPaths is non-empty."
+    },
+    "machServiceConnects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Mach service names the plugin may connect to (XPC services + other system services)."
+    }
+  }
+}

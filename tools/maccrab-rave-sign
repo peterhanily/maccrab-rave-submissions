@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+maccrab-rave-sign — Ed25519-sign rave catalog/revocations/appcast files.
+
+Reads a 32-byte raw Ed25519 private key and signs the given file(s),
+emitting <file>.sig (64-byte raw signature) next to each input.
+
+Usage:
+    maccrab-rave-sign --key path/to/maccrab-rave-catalog.key <file> [<file>...]
+
+Or to sign every public-distribution file in rave/:
+    maccrab-rave-sign --key ... --rave-tree rave/
+
+Reviewed == signed (RECOMMENDED for the signing ceremony):
+    Pass --expect-hashes <manifest> so the tool refuses to sign anything that
+    is not exactly what the maintainer reviewed. A manifest is a plain-text
+    file mapping target-path → expected SHA-256 (one per line, "path  sha256",
+    blank lines and "#" comments ignored — the same line shape emitted by
+    maccrab-rave-canonical-hash). The operator eyeballs the manifest against
+    the approved commit, then:
+
+        maccrab-rave-sign --key ... --expect-hashes reviewed.sha256 \
+            --rave-tree rave/
+
+    With --expect-hashes the tool computes each target's SHA-256 and FAILS
+    CLOSED: if any target is absent from the manifest (e.g. an unreviewed kit
+    that was dropped into kits/), or any computed hash does not match the
+    manifest, the whole run aborts and NOTHING is signed. Every kit must
+    therefore appear as its own explicit, reviewed entry in the manifest —
+    a directory tree is never blanket-trusted.
+
+    Without --expect-hashes the legacy behavior is unchanged (signs whatever
+    targets are given). Prefer --expect-hashes for any default-catalog signing.
+
+Verification:
+    Operator's MacCrab reads <file> + <file>.sig + the public key at
+    /rave/keys/catalog.pub; runs Ed25519 verify; refuses to use the file
+    if the signature doesn't match.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except ImportError:
+    print("error: python3 -m pip install --user cryptography", file=sys.stderr)
+    sys.exit(2)
+
+
+def sign_file(priv: Ed25519PrivateKey, path: Path) -> Path:
+    data = path.read_bytes()
+    sig = priv.sign(data)
+    out = path.with_suffix(path.suffix + ".sig")
+    out.write_bytes(sig)
+    return out
+
+
+def discover_targets(rave_tree: Path) -> list[Path]:
+    """Files that should be signed by the project key:
+       - catalog.json (when it exists; future master index)
+       - catalog/*.json (per-plugin entries)
+       - revocations.json
+       - kits/*.json
+       - appcast.xml (when it exists)
+    """
+    targets: list[Path] = []
+    if (rave_tree / "catalog.json").exists():
+        targets.append(rave_tree / "catalog.json")
+    targets.extend(sorted((rave_tree / "catalog").glob("*.json")) if (rave_tree / "catalog").is_dir() else [])
+    if (rave_tree / "revocations.json").exists():
+        targets.append(rave_tree / "revocations.json")
+    targets.extend(sorted((rave_tree / "kits").glob("*.json")) if (rave_tree / "kits").is_dir() else [])
+    if (rave_tree / "appcast.xml").exists():
+        targets.append(rave_tree / "appcast.xml")
+    return targets
+
+
+def _norm(path) -> str:
+    """Stable key for matching a target path against a manifest entry.
+
+    Normalizes separators and "./"/".."/"//" segments so that, e.g.,
+    "rave/kits/x.json" and "./rave/kits/x.json" compare equal. Does NOT
+    resolve symlinks or touch the filesystem — matching is purely lexical so
+    the operator can author the manifest against the paths they review.
+    """
+    return os.path.normpath(str(path))
+
+
+def load_expect_hashes(manifest: Path) -> dict[str, str]:
+    """Parse a reviewed hash manifest: "path  sha256" per line.
+
+    Blank lines and lines starting with "#" are ignored. The path is the rest
+    of the line after stripping the trailing hex digest, so paths may contain
+    spaces. Returns {normalized_path: lowercase_hex_sha256}. Aborts (exit 2)
+    on a malformed line or duplicate path so an ambiguous manifest can never
+    silently authorize a sign.
+    """
+    if not manifest.exists():
+        print(f"error: --expect-hashes manifest not found: {manifest}", file=sys.stderr)
+        sys.exit(2)
+    expected: dict[str, str] = {}
+    for lineno, raw in enumerate(manifest.read_text().splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.rsplit(None, 1)
+        if len(parts) != 2:
+            print(f"error: manifest line {lineno}: expected 'path  sha256', got: {raw!r}", file=sys.stderr)
+            sys.exit(2)
+        path_str, digest = parts[0].strip(), parts[1].strip().lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            print(f"error: manifest line {lineno}: not a sha256 hex digest: {digest!r}", file=sys.stderr)
+            sys.exit(2)
+        key = _norm(path_str)
+        if key in expected:
+            print(f"error: manifest line {lineno}: duplicate path entry: {path_str!r}", file=sys.stderr)
+            sys.exit(2)
+        expected[key] = digest
+    if not expected:
+        print(f"error: --expect-hashes manifest has no entries: {manifest}", file=sys.stderr)
+        sys.exit(2)
+    return expected
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def verify_against_manifest(targets: list[Path], expected: dict[str, str]) -> None:
+    """Fail CLOSED: abort (exit 2) BEFORE any signing if any target is not
+    present-and-matching in the reviewed manifest. Returns only when every
+    sign-eligible target has a manifest entry whose hash matches; on any
+    problem the whole run aborts and nothing is written.
+    """
+    problems: list[str] = []
+    for target in targets:
+        if target.suffix == ".sig":
+            continue
+        if not target.exists():
+            # Mirror legacy behavior of skipping non-existent inputs (they are
+            # never signed), so they cannot be a manifest violation either.
+            continue
+        key = _norm(target)
+        if key not in expected:
+            problems.append(f"NOT in reviewed manifest (unreviewed target): {target}")
+            continue
+        actual = sha256_file(target)
+        if actual != expected[key]:
+            problems.append(
+                f"hash MISMATCH: {target}\n"
+                f"    reviewed: {expected[key]}\n"
+                f"    on disk:  {actual}"
+            )
+    if problems:
+        print("error: --expect-hashes gate FAILED — signing aborted, nothing written:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(2)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--key", type=Path, required=True, help="path to 32-byte raw Ed25519 private key")
+    parser.add_argument("--rave-tree", type=Path, help="walk a rave/ tree and sign all distribution files")
+    parser.add_argument(
+        "--expect-hashes",
+        type=Path,
+        metavar="MANIFEST",
+        help="reviewed 'path  sha256' manifest; refuse to sign any target absent or mismatched (fail-closed)",
+    )
+    parser.add_argument("files", type=Path, nargs="*", help="specific files to sign")
+    args = parser.parse_args()
+
+    priv_bytes = args.key.read_bytes()
+    if len(priv_bytes) != 32:
+        print(f"error: expected 32-byte raw private key, got {len(priv_bytes)} bytes", file=sys.stderr)
+        sys.exit(2)
+    priv = Ed25519PrivateKey.from_private_bytes(priv_bytes)
+
+    targets: list[Path] = list(args.files)
+    if args.rave_tree:
+        targets.extend(discover_targets(args.rave_tree))
+    if not targets:
+        print("error: no files to sign (provide arguments or --rave-tree)", file=sys.stderr)
+        sys.exit(2)
+
+    # Fail-closed gate: with --expect-hashes, verify EVERY target against the
+    # reviewed manifest before writing a single signature. Any unreviewed or
+    # mismatched target aborts the whole run (nothing signed).
+    if args.expect_hashes is not None:
+        expected = load_expect_hashes(args.expect_hashes)
+        verify_against_manifest(targets, expected)
+
+    for target in targets:
+        if not target.exists():
+            print(f"warn: skipping non-existent: {target}", file=sys.stderr)
+            continue
+        if target.suffix == ".sig":
+            continue
+        sig = sign_file(priv, target)
+        print(f"signed: {target} → {sig.name}")
+
+
+if __name__ == "__main__":
+    main()

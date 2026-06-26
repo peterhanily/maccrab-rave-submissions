@@ -1,0 +1,614 @@
+# The Stage 1-6 vetting pipeline. Runs on every PR that touches catalog/ or
+# schemas/ AND on manual dispatch. The terminal `vetting-gate` job is the single
+# named check api/admin/review.js requires before merging a submission PR — so a
+# submission can NEVER auto-merge on an unrelated green check (e.g. rave-test.yml)
+# or when this pipeline never ran.
+#
+# Plan reference: §4.4 (six-stage vetting pipeline).
+
+name: rave-validate-submission
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      # The submission surface — a contrib plugin PR adds/edits catalog/<id>.json.
+      # (Schema-only / maintainer PRs do not run the plugin-reproducibility vetting.)
+      - 'catalog/**'
+
+# One in-flight vetting run per PR — a new push cancels the superseded run, so a
+# single submitter cannot stack parallel macOS builds and burn Actions minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  stage-1-manifest-validation:
+    name: Stage 1 — manifest + namespace validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install jsonschema
+        run: pip install jsonschema
+
+      - name: Validate all catalog artifacts against their schemas
+        # entries + the aggregate catalog.json + kits + revocations
+        run: python3 tools/validate-catalog-schemas
+
+      - name: Check for plugin ID collisions across catalog
+        run: |
+          set -e
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+          from collections import Counter
+
+          ids = []
+          for path in sorted(Path("catalog").glob("*.json")):
+              data = json.loads(path.read_text())
+              entry_id = data.get("id")
+              file_id = path.stem
+              if entry_id != file_id:
+                  print(f"FAIL: {path} has id={entry_id} but filename suggests {file_id}")
+                  raise SystemExit(1)
+              ids.append(entry_id)
+
+          collisions = [i for i, n in Counter(ids).items() if n > 1]
+          if collisions:
+              print(f"FAIL: id collisions: {collisions}")
+              raise SystemExit(1)
+          print(f"OK: {len(ids)} unique plugin IDs in the catalog")
+          PY
+
+  stage-2-capability-consistency:
+    name: Stage 2 — capability consistency (heuristic, not enforcement)
+    runs-on: macos-14
+    needs: stage-1-manifest-validation
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Identify catalog entries changed in this PR
+        id: changed
+        run: |
+          # On PR: diff against base. On workflow_dispatch: scan all entries.
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+          else
+              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+          fi
+          echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
+          echo "files to scan:"
+          printf '  %s\n' ${CHANGED:-"(none)"}
+
+      - name: Run Stage 2 on each plugin's source
+        env:
+          CHANGED: ${{ steps.changed.outputs.changed }}
+        run: |
+          set -e
+          if [[ -z "${CHANGED}" ]]; then
+              echo "no catalog entries changed — nothing to scan"
+              exit 0
+          fi
+
+          FAIL_TOTAL=0
+          {
+              echo "## Stage 2 — capability consistency"
+              echo
+              echo "| Plugin | Files | Fails | Warns |"
+              echo "|---|---|---|---|"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for ENTRY in ${CHANGED}; do
+              [[ -f "${ENTRY}" ]] || continue
+              PLUGIN_ID=$(jq -r '.id' "${ENTRY}")
+              SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
+              SOURCE_COMMIT=$(jq -r '.approved_at_commit' "${ENTRY}")
+
+              echo "==> scanning ${PLUGIN_ID} (${SOURCE_REPO}@${SOURCE_COMMIT:0:8})"
+              CLONE_DIR=$(mktemp -d)
+              gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --depth=20 --no-tags
+              (cd "${CLONE_DIR}" && git checkout -q "${SOURCE_COMMIT}" 2>/dev/null || echo "warn: could not checkout ${SOURCE_COMMIT}, scanning HEAD")
+
+              REPORT=$(python3 tools/stage2-capability-consistency.py "${CLONE_DIR}" 2>/dev/null || true)
+              FAILS=$(echo "${REPORT}" | jq -r '.fail_count // 0')
+              WARNS=$(echo "${REPORT}" | jq -r '.warn_count // 0')
+              FILES=$(echo "${REPORT}" | jq -r '.swift_files_scanned // 0')
+              FAIL_TOTAL=$((FAIL_TOTAL + FAILS))
+
+              echo "| ${PLUGIN_ID} | ${FILES} | ${FAILS} | ${WARNS} |" >> "${GITHUB_STEP_SUMMARY}"
+
+              if [[ "${FAILS}" -gt 0 ]]; then
+                  echo
+                  echo "### ${PLUGIN_ID} — fail details" >> "${GITHUB_STEP_SUMMARY}"
+                  echo "${REPORT}" | jq -r '.findings[] | select(.severity == "fail") | "- **\(.check)** at `\(.file):\(.line)` — \(.detail)"' >> "${GITHUB_STEP_SUMMARY}"
+              fi
+              if [[ "${WARNS}" -gt 0 ]]; then
+                  echo
+                  echo "### ${PLUGIN_ID} — warn details (review only; not blocking)" >> "${GITHUB_STEP_SUMMARY}"
+                  echo "${REPORT}" | jq -r '.findings[] | select(.severity == "warn") | "- **\(.check)** at `\(.file):\(.line)` — \(.detail)"' >> "${GITHUB_STEP_SUMMARY}"
+              fi
+          done
+
+          if [[ "${FAIL_TOTAL}" -gt 0 ]]; then
+              echo "::error::stage-2 found ${FAIL_TOTAL} consistency failure(s) across changed plugins"
+              exit 1
+          fi
+          echo "stage-2 passed (warns may be present; not blocking)"
+
+  stage-3-build-sign-reproducibility:
+    name: Stage 3 — build, sign, reproducibility
+    runs-on: macos-14
+    needs: stage-2-capability-consistency
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Identify the catalog entry changed in this PR
+        id: changed
+        run: |
+          # On PR: diff against base to find the submitted plugin entry. On
+          # workflow_dispatch (no submission context): no-op cleanly.
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+          else
+              CHANGED=""
+          fi
+          echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
+          echo "entries to rebuild:"
+          printf '  %s\n' ${CHANGED:-"(none)"}
+
+      - name: Rebuild changed plugin(s) and verify canonical hash
+        # NOTE: needs a real submission-PR smoke test once the contrib channel opens.
+        env:
+          CHANGED: ${{ steps.changed.outputs.changed }}
+        run: |
+          # Reproducibility check, adapted from rave-rebuild-and-verify.yml:
+          # clone the author source, run their scripts/package-plugin.sh, canonical-
+          # hash the rebuilt zip, and compare to the catalog-pinned
+          # canonical_tree_sha256. Fail-closed on any mismatch / missing field /
+          # clone or build failure, so `vetting-gate` stays un-green and
+          # api/admin/review.js refuses the merge. First-party entries are added by
+          # the owner directly and never flow through this gate.
+          set -e
+          if [[ -z "${CHANGED}" ]]; then
+              echo "no catalog entries changed — nothing to rebuild (workflow_dispatch no-op)"
+              exit 0
+          fi
+
+          for ENTRY in ${CHANGED}; do
+              [[ -f "${ENTRY}" ]] || continue
+              PLUGIN_ID=$(jq -r '.id' "${ENTRY}")
+              SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
+              VERSION=$(jq -r '.current_version' "${ENTRY}")
+              SOURCE_COMMIT=$(jq -r --arg v "${VERSION}" '.versions[$v].source_commit' "${ENTRY}")
+              CANONICAL_SHA=$(jq -r --arg v "${VERSION}" '.versions[$v].canonical_tree_sha256' "${ENTRY}")
+
+              echo "==> rebuilding ${PLUGIN_ID} v${VERSION} (${SOURCE_REPO}@${SOURCE_COMMIT:0:8})"
+
+              # Fail closed on any missing field — a contrib entry MUST pin its
+              # source and the canonical hash to be independently reproducible.
+              for FIELD in SOURCE_REPO VERSION SOURCE_COMMIT CANONICAL_SHA; do
+                  VAL="${!FIELD}"
+                  if [[ -z "${VAL}" || "${VAL}" == "null" ]]; then
+                      echo "::error::${PLUGIN_ID}: missing/empty ${FIELD} — cannot verify reproducibility"
+                      exit 1
+                  fi
+              done
+
+              # Clone the author source at the pinned commit. SOURCE_REPO is like
+              # https://github.com/owner/repo.
+              CLONE_DIR=$(mktemp -d)
+              if ! gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}/source-rebuild"; then
+                  echo "::error::${PLUGIN_ID}: failed to clone ${SOURCE_REPO}"
+                  exit 1
+              fi
+              if ! (cd "${CLONE_DIR}/source-rebuild" && git checkout "${SOURCE_COMMIT}"); then
+                  echo "::error::${PLUGIN_ID}: could not checkout source_commit ${SOURCE_COMMIT}"
+                  exit 1
+              fi
+
+              # Authors are expected to provide scripts/package-plugin.sh at the
+              # path the plugin template establishes. A different build layout is
+              # non-standard and fails closed (needs manual review).
+              if [[ ! -x "${CLONE_DIR}/source-rebuild/scripts/package-plugin.sh" ]]; then
+                  echo "::error::${PLUGIN_ID}: source repo missing executable scripts/package-plugin.sh — non-standard build layout"
+                  exit 1
+              fi
+              if ! (cd "${CLONE_DIR}/source-rebuild" && ./scripts/package-plugin.sh); then
+                  echo "::error::${PLUGIN_ID}: scripts/package-plugin.sh failed"
+                  exit 1
+              fi
+
+              # Locate the produced .maccrabplugin.zip — author build scripts
+              # conventionally emit it under dist/ or build/.
+              REBUILD_ZIP=$(find "${CLONE_DIR}/source-rebuild/dist" "${CLONE_DIR}/source-rebuild/build" -name '*.maccrabplugin.zip' 2>/dev/null | head -1)
+              if [[ -z "${REBUILD_ZIP}" ]]; then
+                  echo "::error::${PLUGIN_ID}: could not locate the rebuilt .maccrabplugin.zip"
+                  exit 1
+              fi
+
+              REBUILD_HASH=$(tools/maccrab-rave-canonical-hash "${REBUILD_ZIP}")
+              echo "catalog-pinned : ${CANONICAL_SHA}"
+              echo "your rebuild   : ${REBUILD_HASH}"
+              if [[ "${REBUILD_HASH}" != "${CANONICAL_SHA}" ]]; then
+                  echo "::error::${PLUGIN_ID}: REPRODUCIBILITY FAILED — rebuild does not match catalog-pinned canonical hash"
+                  echo "::error::either the catalog entry is wrong/compromised, or this build environment differs from the one it was approved against"
+                  exit 1
+              fi
+
+              {
+                  echo "## Stage 3 — reproducibility: ${PLUGIN_ID} v${VERSION}"
+                  echo "- Source: \`${SOURCE_REPO}@${SOURCE_COMMIT}\`"
+                  echo "- Catalog-pinned canonical hash: \`${CANONICAL_SHA}\`"
+                  echo "- Rebuild canonical hash: \`${REBUILD_HASH}\` ✓"
+              } >> "${GITHUB_STEP_SUMMARY}"
+              echo "${PLUGIN_ID}: REPRODUCIBILITY VERIFIED"
+          done
+
+  stage-4-containment-validation:
+    name: Stage 4 — containment validation
+    runs-on: macos-14
+    needs: stage-3-build-sign-reproducibility
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Stage 4a — author-supplied fixtures (signal of intent)
+        run: |
+          # Author's plugin includes ≥5 sandbox-escape fixtures at Tests/adversarial/.
+          # Each must fail inside Tier B containment. Authors who can't articulate
+          # what their plugin shouldn't be able to do are surfaced for manual review.
+          # Per plan §4.4 — author fixtures are signal-of-intent, NOT the load-bearing
+          # check; Stage 4b below is the actual assessment.
+
+          set -e
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+          else
+              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+          fi
+
+          if [[ -z "${CHANGED}" ]]; then
+              echo "no catalog entries changed — skipping stage-4a"
+              exit 0
+          fi
+
+          FAIL_TOTAL=0
+          for ENTRY in ${CHANGED}; do
+              [[ -f "${ENTRY}" ]] || continue
+              SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
+              SOURCE_COMMIT=$(jq -r '.approved_at_commit' "${ENTRY}")
+              CLONE_DIR=$(mktemp -d)
+              gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --depth=20 --no-tags
+              (cd "${CLONE_DIR}" && git checkout -q "${SOURCE_COMMIT}" 2>/dev/null || true)
+
+              if [[ ! -d "${CLONE_DIR}/Tests/adversarial" ]]; then
+                  echo "::warning::author plugin has no Tests/adversarial/ — flag for manual review (plan §4.4 Stage 4a)"
+                  continue
+              fi
+
+              FIXTURE_COUNT=$(find "${CLONE_DIR}/Tests/adversarial" -name '*.sh' -o -name '*.swift' | wc -l | tr -d ' ')
+              if [[ "${FIXTURE_COUNT}" -lt 5 ]]; then
+                  echo "::warning::author plugin has only ${FIXTURE_COUNT} adversarial fixtures (plan §4.4 Stage 4a requires ≥5)"
+              fi
+              echo "stage-4a: author provided ${FIXTURE_COUNT} fixtures for $(jq -r '.id' ${ENTRY})"
+          done
+
+      - name: Stage 4b — rave-supplied adversarial fixtures (load-bearing check)
+        run: |
+          # The canonical Stage 4b corpus is at vetting/adversarial-fixtures/.
+          # The harness binary currently lives at rave-prototypes/prototype-contained-plugin/
+          # for historical reasons; moves into vetting/adversarial-fixtures/harness/
+          # at the plugin-template repo split per docs/runbooks/plugin-template-split.md.
+
+          set -e
+
+          # Sanity-check the canonical SBPL profile is present.
+          if [[ ! -f vetting/adversarial-fixtures/tier-b-base.sb ]]; then
+              echo "::error::canonical Tier B SBPL profile missing at vetting/adversarial-fixtures/tier-b-base.sb"
+              exit 1
+          fi
+
+          # Build the harness + run the fixture corpus. Variant B (sandbox-exec
+          # + Hardened Runtime) is the v0 production containment per plan §3.4 v4.4
+          # and must pass 10/10. Variant A (App Sandbox) is run for comparison /
+          # documentation; its 7/10 is expected and not a failure of this job.
+          cd rave-prototypes/prototype-contained-plugin
+          ./scripts/build-and-sign.sh > /dev/null
+          ./scripts/build-no-app-sandbox.sh > /dev/null
+
+          # Replace the prototype's SBPL profile with the canonical one so this
+          # run actually tests rave's canonical profile, not a possibly-drifted copy.
+          cp ../../vetting/adversarial-fixtures/tier-b-base.sb sbpl/tier-b-base.sb
+
+          # Run the layered comparison; capture the result.
+          set +e
+          ./scripts/run-fixtures-layered.sh
+          RESULT=$?
+          set -e
+
+          if [[ "${RESULT}" -ne 0 ]]; then
+              echo "::error::Stage 4b: Variant B (sandbox-exec custom profile) did not pass all fixtures — Tier B containment is weaker than the plan asserts"
+              exit 1
+          fi
+
+          {
+              echo "## Stage 4b — containment validation"
+              echo "- Tier B SBPL profile: \`vetting/adversarial-fixtures/tier-b-base.sb\`"
+              echo "- Variant B (canonical v0 model): **10/10 fixtures passed**"
+              echo "- Plan §3.4 v4.4 containment model confirmed"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "stage-4b passed (10/10 Variant B fixtures)"
+
+  stage-5-reputation-and-diff:
+    name: Stage 5 — reputation + diff analysis
+    runs-on: ubuntu-latest
+    needs: stage-4-containment-validation
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0   # Stage 5b needs the prior approved version's catalog entry from git history
+
+      - name: Stage 5a — author reputation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The contrib PR is opened by the GitHub App bot (api/submit.js →
+          # openCatalogPR), so github.event.pull_request.user.login is the BOT,
+          # never the human submitter. The Worker records the submitter in the PR
+          # body two ways: a "Submitter: @login" line and a
+          # "<!-- submission_id: <uuid> -->" marker (the canonical key into the D1
+          # submissions table). Reputation MUST be assessed against that human.
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Per vetting/policy.md v0 thresholds:
+          #   - Author GitHub account age >= 30 days at first PR
+          #   - Prior commit history >= 5 commits outside plugin repo in last 12 months
+          # Cross-check against abusive-account list (empty at v0).
+
+          set -e
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+          else
+              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+          fi
+
+          if [[ -z "${CHANGED}" ]]; then
+              echo "no catalog entries changed — skipping stage-5a"
+              exit 0
+          fi
+
+          # Resolve the REAL human submitter — NOT github.event.pull_request.user.login
+          # (that is the GitHub App bot that opened the PR) and NOT the catalog
+          # entry's source_owner (which differs for forks / maintainer-authored
+          # entries). Production: read the "<!-- submission_id: <uuid> -->" marker
+          # from the PR body and look up submitter_github_id in D1. Here
+          # (dispatch-only stub, no D1 binding) we parse the "Submitter: @login"
+          # line the Worker writes into the PR body; on manual dispatch (no PR) we
+          # fall back to the actor that triggered the run.
+          PR_AUTHOR=""
+          if [[ -n "${PR_BODY:-}" ]]; then
+              PR_AUTHOR=$(printf '%s\n' "${PR_BODY}" | grep -oE 'Submitter: @[A-Za-z0-9-]+' | head -1 | sed 's/.*@//')
+          fi
+          PR_AUTHOR="${PR_AUTHOR:-${{ github.actor }}}"
+          if [[ -z "${PR_AUTHOR}" ]]; then
+              echo "::error::could not resolve the human submitter (PR body missing the 'Submitter: @login' line / submission_id marker)"
+              exit 1
+          fi
+          ABUSIVE_LIST="vetting/abusive-accounts.txt"
+
+          if [[ -f "${ABUSIVE_LIST}" ]] && grep -q "^${PR_AUTHOR}$" "${ABUSIVE_LIST}"; then
+              echo "::error::PR author ${PR_AUTHOR} is on the abusive-accounts list"
+              exit 1
+          fi
+
+          # Account age via gh api
+          CREATED_AT=$(gh api "users/${PR_AUTHOR}" --jq '.created_at')
+          AGE_DAYS=$(( ( $(date +%s) - $(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${CREATED_AT}" +%s) ) / 86400 ))
+          if [[ "${AGE_DAYS}" -lt 30 ]]; then
+              echo "::error::PR author ${PR_AUTHOR} account is ${AGE_DAYS} days old (policy threshold: 30)"
+              exit 1
+          fi
+
+          # Prior commit history check — count public commits in last 12 months
+          # outside the plugin repos. This is a proxy; production may use a
+          # more refined query.
+          PRIOR_COMMITS=$(gh api "search/commits?q=author:${PR_AUTHOR}+committer-date:>$(date -j -v-12m +%Y-%m-%d)" --jq '.total_count' 2>/dev/null || echo "0")
+          if [[ "${PRIOR_COMMITS}" -lt 5 ]]; then
+              echo "::warning::PR author ${PR_AUTHOR} has only ${PRIOR_COMMITS} prior commits in last 12mo (policy preference: ≥5); flag for maintainer judgment"
+          fi
+
+          {
+              echo "## Stage 5a — author reputation"
+              echo "- Author: \`${PR_AUTHOR}\`"
+              echo "- Account age: ${AGE_DAYS} days (≥30 required) ✓"
+              echo "- Prior commits last 12mo: ${PRIOR_COMMITS} (≥5 preferred)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Stage 5b — diff analysis (version updates)
+        run: |
+          # Per vetting/policy.md v0 thresholds.
+
+          set -e
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+          else
+              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+          fi
+          if [[ -z "${CHANGED}" ]]; then
+              echo "no catalog entries changed — skipping stage-5b"
+              exit 0
+          fi
+
+          FLAG_TOTAL=0
+          BASE_REF="${GITHUB_BASE_REF:-origin/main}"
+
+          {
+              echo "## Stage 5b — diff analysis"
+              echo
+              echo "| Plugin | Capability delta | LOC | Sig workflow change | Red-flag hits | Verdict |"
+              echo "|---|---|---|---|---|---|"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          for ENTRY in ${CHANGED}; do
+              [[ -f "${ENTRY}" ]] || continue
+              PLUGIN_ID=$(jq -r '.id' "${ENTRY}")
+
+              # Is the entry NEW (first PR) or an UPDATE (catalog already has it)?
+              if git cat-file -e "${BASE_REF}:${ENTRY}" 2>/dev/null; then
+                  KIND="update"
+              else
+                  KIND="new"
+                  echo "| ${PLUGIN_ID} | (new entry — first PR) | n/a | n/a | n/a | manual-review-required |" >> "${GITHUB_STEP_SUMMARY}"
+                  echo "::warning::${PLUGIN_ID}: first-PR catalog entry; manual maintainer review required per plan §4.5"
+                  continue
+              fi
+
+              # Capability set delta
+              OLD_CAPS=$(git show "${BASE_REF}:${ENTRY}" | jq -c '.versions[.current_version].vetting.automated_passes // []')
+              # NEW caps would require dereferencing the new manifest from source; for the prototype, just diff the catalog entry
+              CAP_DELTA=$(git diff "${BASE_REF}" -- "${ENTRY}" | grep -E '^\+.*"(files|endpoints|subprocesses|metadata_namespaces|mcp_tools)"' | wc -l | tr -d ' ')
+
+              # Source diff size — clone author repo at new source_commit, diff against approved_at_commit
+              NEW_COMMIT=$(jq -r '.versions[.current_version].source_commit' "${ENTRY}")
+              OLD_COMMIT=$(git show "${BASE_REF}:${ENTRY}" | jq -r '.versions[.current_version].source_commit')
+              SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
+
+              LOC_DELTA="(unknown)"
+              if [[ "${OLD_COMMIT}" != "${NEW_COMMIT}" && "${OLD_COMMIT}" != "null" && "${NEW_COMMIT}" != "null" ]]; then
+                  CLONE_DIR=$(mktemp -d)
+                  gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --no-tags 2>/dev/null || true
+                  if [[ -d "${CLONE_DIR}/.git" ]]; then
+                      LOC_DELTA=$( (cd "${CLONE_DIR}" && git diff --stat "${OLD_COMMIT}" "${NEW_COMMIT}" 2>/dev/null | tail -1 | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0") )
+                  fi
+              fi
+
+              # Signer key change (v1 field signer_public_key_sha256; the old
+              # signing_identity_pattern was a v0 Sigstore field, removed in v1).
+              OLD_SIG=$(git show "${BASE_REF}:${ENTRY}" | jq -r '.signer_public_key_sha256')
+              NEW_SIG=$(jq -r '.signer_public_key_sha256' "${ENTRY}")
+              SIG_CHANGE="no"
+              if [[ "${OLD_SIG}" != "${NEW_SIG}" ]]; then SIG_CHANGE="**YES**"; FLAG_TOTAL=$((FLAG_TOTAL + 1)); fi
+
+              # Red-flag pattern scan against the source diff
+              RED_FLAGS=0
+              if [[ -n "${OLD_COMMIT}" && -n "${NEW_COMMIT}" && -d "${CLONE_DIR:-}/.git" ]]; then
+                  DIFF=$( (cd "${CLONE_DIR}" && git diff "${OLD_COMMIT}" "${NEW_COMMIT}" 2>/dev/null) )
+                  # Pattern checks (subset; full set in red-flag-patterns.md)
+                  if echo "${DIFF}" | grep -qE '^\+.*dlopen\(.*\)' && ! echo "${DIFF}" | grep -qE '^\+.*dlopen\("[^"]+"'; then
+                      RED_FLAGS=$((RED_FLAGS + 1))
+                      echo "::warning::${PLUGIN_ID}: matches pattern-dynamic-dlopen"
+                  fi
+                  if echo "${DIFF}" | grep -qE '^\+.*"/bin/sh|^\+.*"/usr/bin/python|^\+.*"/usr/bin/osascript|^\+.*"/usr/bin/perl|^\+.*"/usr/bin/ruby'; then
+                      RED_FLAGS=$((RED_FLAGS + 1))
+                      echo "::warning::${PLUGIN_ID}: matches pattern-interpreter-spawn"
+                  fi
+                  if echo "${DIFF}" | grep -qE '^\+.*Data\(base64Encoded' && echo "${DIFF}" | grep -qE '^\+.*write\('; then
+                      RED_FLAGS=$((RED_FLAGS + 1))
+                      echo "::warning::${PLUGIN_ID}: matches pattern-base64-decoded-executable"
+                  fi
+                  if echo "${DIFF}" | grep -qE '^\+.*dlsym\([^,]+,\s*[^"]'; then
+                      RED_FLAGS=$((RED_FLAGS + 1))
+                      echo "::warning::${PLUGIN_ID}: matches pattern-dlsym-obfuscated-symbol"
+                  fi
+              fi
+              FLAG_TOTAL=$((FLAG_TOTAL + RED_FLAGS))
+
+              # LOC threshold check (per policy.md: 1000)
+              LOC_FLAG=""
+              if [[ "${LOC_DELTA}" != "(unknown)" && "${LOC_DELTA}" -gt 1000 ]]; then
+                  LOC_FLAG=" (>1000)"
+                  FLAG_TOTAL=$((FLAG_TOTAL + 1))
+                  echo "::warning::${PLUGIN_ID}: source diff is ${LOC_DELTA} LOC (auto-merge threshold: 1000)"
+              fi
+
+              VERDICT="auto-merge-eligible"
+              [[ "${CAP_DELTA}" -gt 0 || "${SIG_CHANGE}" == "**YES**" || "${RED_FLAGS}" -gt 0 || "${LOC_DELTA}" -gt 1000 ]] && VERDICT="manual-review-required"
+
+              echo "| ${PLUGIN_ID} | ${CAP_DELTA} lines | ${LOC_DELTA}${LOC_FLAG} | ${SIG_CHANGE} | ${RED_FLAGS} | ${VERDICT} |" >> "${GITHUB_STEP_SUMMARY}"
+          done
+
+          if [[ "${FLAG_TOTAL}" -gt 0 ]]; then
+              echo
+              echo "stage-5b: ${FLAG_TOTAL} flag(s) — auto-merge NOT eligible; manual review required"
+              # Per plan §4.6, flags don't fail vetting outright — they require manual review
+              # The merging tool reads this verdict and chooses auto-merge vs flag-for-review
+          else
+              echo "stage-5b: no flags; auto-merge eligible per plan §4.6 policy"
+          fi
+
+  stage-6-ai-assisted-review:
+    name: Stage 6 — AI-assisted code review (supplementary, DISABLED at v0)
+    runs-on: ubuntu-latest
+    needs: stage-5-reputation-and-diff
+    # Per vetting/policy.md v0 threshold: Stage 6 stays disabled until
+    # (a) local-LLM choice committed per plan §16 Q6,
+    # (b) prompt-injection sanitization layer built per plan §11 A10,
+    # (c) maintainer-training framing documented.
+    # When enabling, change `if: false` → `if: true` and remove this comment.
+    if: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Sanitize source for prompt injection
+        run: |
+          # The sanitization tool is at tools/stage6-sanitize.py (when built).
+          # It strips:
+          #   - comments containing instruction-like patterns (e.g. "ignore previous instructions")
+          #   - description fields > 400 chars (also enforced by manifest schema)
+          #   - HTML/markdown structure that an LLM might interpret as system instructions
+          # Output: a sanitized snapshot of the source tree the LLM sees, NOT the raw source.
+          echo "stage-6 sanitization placeholder (tool not yet built — see plan §11 A10)"
+          exit 0
+
+      - name: LLM review of suspicious patterns
+        run: |
+          # The LLM choice is plan §16 Q6 — Phase 0a candidate research.
+          # Production: local model only (no cloud API; reduces hijack surface).
+          # Acceptance criterion: LLM output framed as "flagged for inspection",
+          # NEVER as "approved by LLM". Maintainer makes the merge decision.
+          echo "stage-6 LLM invocation placeholder"
+          exit 0
+
+      - name: Surface flagged regions to maintainer
+        run: |
+          # Output structure: list of {file, line, region, flag-reason}.
+          # The maintainer review tool renders these in the PR with explicit
+          # "LLM flagged" framing per plan §11 A10 to discourage rubber-stamping.
+          echo "stage-6 flagged-regions placeholder"
+          exit 0
+
+      - name: Stage 6 status note
+        if: always()
+        run: |
+          {
+              echo "## Stage 6 — AI-assisted review"
+              echo
+              echo "**Disabled at v0** per vetting/policy.md Phase 0b-finalization threshold."
+              echo "Enables when local-LLM choice + sanitization layer + maintainer training all land."
+              echo
+              echo "See: plan §16 Q6, plan §11 A10."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  vetting-gate:
+    name: vetting-gate
+    runs-on: ubuntu-latest
+    # The SINGLE named check api/admin/review.js requires before merging a
+    # submission PR (env VETTING_REQUIRED_CHECK, default "vetting-gate"). It is
+    # green ONLY when every load-bearing stage passed; if any stage fails this job
+    # is skipped, so the merge gate sees the gate absent / not-success and refuses
+    # (fail-closed). stage-6 is intentionally disabled and excluded from `needs`.
+    needs:
+      - stage-1-manifest-validation
+      - stage-2-capability-consistency
+      - stage-3-build-sign-reproducibility
+      - stage-4-containment-validation
+      - stage-5-reputation-and-diff
+    steps:
+      - run: echo "all load-bearing vetting stages passed — vetting-gate is green"

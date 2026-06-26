@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+verify-catalog-signatures — fail-closed Ed25519 verification of every
+public-distribution rave file against rave/keys/catalog.pub.
+
+This is the PUBLICATION TRUST GATE. The catalog's whole security model rests on
+"a catalog/kit/revocation JSON that lacks a valid detached .sig is inert" — but
+that is only true if it is ENFORCED before the bytes are served. build.sh and
+.github/workflows/rave-publish-site.yml both call this BEFORE any Cloudflare
+deploy; a non-zero exit blocks the build/deploy so an unsigned or
+bad-signature entry can never reach the static tree operators fetch.
+
+Verification recipe (matches rave/tools/maccrab-rave-sign + docs/verification):
+    Ed25519PublicKey.from_public_bytes(<rave>/keys/catalog.pub).verify(<f>.sig, <f> bytes)
+
+Verification only uses the PUBLIC key, so running this in CI is safe — the
+offline private signing key is never involved.
+
+Usage:
+    rave/tools/verify-catalog-signatures               # verifies the rave/ tree
+    rave/tools/verify-catalog-signatures --rave-dir path/to/rave
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.exceptions import InvalidSignature
+except ImportError:
+    print("error: python 'cryptography' package required (pip install cryptography)", file=sys.stderr)
+    sys.exit(2)
+
+# A 64-hex SHA-256 of all zeros is the "no real artifact yet" placeholder the
+# regenerate-catalog stub writes. It is NOT a real digest and must never count
+# as a populated reproducibility/transport anchor.
+ZERO_SHA256 = "0" * 64
+
+
+def _is_real_sha256(value) -> bool:
+    """True only for a present, 64-hex, non-all-zero SHA-256 string."""
+    if not isinstance(value, str):
+        return False
+    v = value.strip().lower()
+    if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+        return False
+    return v != ZERO_SHA256
+
+
+def structural_official_gate(rave: Path) -> int:
+    """Deploy-blocking structural gate for the "official" channel.
+
+    Signatures prove the bytes are the maintainer-approved bytes; this gate
+    proves an OFFERABLE "official" entry MECHANICALLY means a published,
+    reproducible, publisher-pinned, ACTIVE release. For every catalog/*.json
+    entry on channel "official" whose status is NOT "pre-release" (i.e. one the
+    client would offer for one-click install), the entry's current_version MUST
+    carry:
+      - a real (present, non-all-zero) artifact_sha256        (transport anchor)
+      - a real (present, non-all-zero) canonical_tree_sha256  (source==binary)
+      - a present signer_public_key_sha256                    (publisher pin)
+      - status == "active"
+
+    A "pre-release" official entry is an honest, NON-installable placeholder:
+    the client (RaveCatalogEntryState.compute) shows its status and never an
+    Install pill, and its all-zero artifact_sha256 makes the verified install
+    path fail closed if anyone forces it. It is therefore EXEMPT from the
+    artifact/pin requirements so the pre-ceremony catalog can publish before the
+    operator signing ceremony has cut real binaries (the Phase-0 posture the
+    storefront-honesty test enshrines: 0 active entries while pre-release).
+
+    Any all-zero placeholder hash, a missing publisher pin, or a non-active /
+    unknown OFFERABLE status FAILS CLOSED and blocks the deploy. Entries whose
+    channel is not "official" (e.g. "contrib") are skipped — own lifecycle.
+    Returns the number of failing official entries.
+    """
+    fail = 0
+    for f in sorted((rave / "catalog").glob("*.json")):
+        rel = f.relative_to(rave)
+        try:
+            entry = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            # Fail closed: an official channel can't be confirmed on bytes we
+            # can't even parse. (Signature stage reads bytes, not JSON.)
+            print(f"::error file=rave/{rel}::official-gate cannot parse entry: {exc}")
+            fail += 1
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        if entry.get("channel") != "official":
+            continue  # non-official channels have their own lifecycle.
+
+        # A pre-release official entry is an honest, non-installable placeholder
+        # (no client Install pill; its all-zero artifact hash fails the verified
+        # install path closed). Exempt it so the pre-ceremony catalog can publish
+        # before the operator signing ceremony has cut real binaries.
+        if entry.get("status") == "pre-release":
+            continue
+
+        problems: list[str] = []
+
+        if entry.get("status") != "active":
+            problems.append(f"status is {entry.get('status')!r}, must be \"active\" (or \"pre-release\" placeholder)")
+
+        if not isinstance(entry.get("signer_public_key_sha256"), str) or not entry["signer_public_key_sha256"].strip():
+            problems.append("missing signer_public_key_sha256 (publisher pin)")
+
+        cur = entry.get("current_version")
+        versions = entry.get("versions")
+        if not isinstance(cur, str) or not isinstance(versions, dict) or cur not in versions:
+            problems.append(f"current_version {cur!r} has no matching versions[] block")
+        else:
+            ver = versions[cur]
+            ver = ver if isinstance(ver, dict) else {}
+            if not _is_real_sha256(ver.get("artifact_sha256")):
+                problems.append("artifact_sha256 is missing or an all-zero placeholder")
+            if not _is_real_sha256(ver.get("canonical_tree_sha256")):
+                problems.append("canonical_tree_sha256 is missing or an all-zero placeholder")
+
+        if problems:
+            for p in problems:
+                print(f"::error file=rave/{rel}::official entry ({entry.get('id', f.stem)}): {p}")
+            fail += 1
+    return fail
+
+
+def signed_targets(rave: Path) -> list[Path]:
+    """Every file that is published and MUST carry a valid detached .sig."""
+    targets: list[Path] = []
+    for name in ("catalog.json", "revocations.json"):
+        p = rave / name
+        if p.exists():
+            targets.append(p)
+    for sub in ("catalog", "kits"):
+        targets.extend(sorted((rave / sub).glob("*.json")))
+    return targets
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rave-dir", default=str(Path(__file__).resolve().parent.parent),
+                    help="path to the rave/ tree (default: parent of this tool's dir)")
+    args = ap.parse_args()
+    rave = Path(args.rave_dir).resolve()
+
+    pub_path = rave / "keys" / "catalog.pub"
+    if not pub_path.exists():
+        print(f"::error::no catalog public key at {pub_path}", file=sys.stderr)
+        return 1
+    pub = Ed25519PublicKey.from_public_bytes(pub_path.read_bytes())
+
+    targets = signed_targets(rave)
+    if not targets:
+        print(f"::error::no catalog/kit files found under {rave}", file=sys.stderr)
+        return 1
+
+    ok = fail = 0
+    for f in targets:
+        rel = f.relative_to(rave)
+        sig = f.with_suffix(f.suffix + ".sig")
+        if not sig.exists():
+            print(f"::error file=rave/{rel}::missing signature ({sig.name})")
+            fail += 1
+            continue
+        try:
+            pub.verify(sig.read_bytes(), f.read_bytes())
+            ok += 1
+        except InvalidSignature:
+            print(f"::error file=rave/{rel}::Ed25519 signature does not verify against keys/catalog.pub")
+            fail += 1
+
+    print(f"verify-catalog-signatures: {ok} valid, {fail} invalid/missing "
+          f"(of {len(targets)} published files, against {pub_path.name})")
+
+    # Structural gate: "official" must mechanically mean active + reproducible +
+    # publisher-pinned. Runs in addition to (never instead of) signature checks.
+    struct_fail = structural_official_gate(rave)
+    print(f"verify-catalog-signatures: official-channel structural gate — "
+          f"{struct_fail} official entr{'y' if struct_fail == 1 else 'ies'} blocked")
+
+    if fail:
+        print("::error::PUBLICATION TRUST GATE FAILED — refusing to build/deploy "
+              "an unsigned or bad-signature catalog.")
+        return 1
+    if struct_fail:
+        print("::error::OFFICIAL-CHANNEL STRUCTURAL GATE FAILED — refusing to "
+              "build/deploy: an official entry is non-active or lacks a real "
+              "artifact_sha256 / canonical_tree_sha256 / signer_public_key_sha256.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

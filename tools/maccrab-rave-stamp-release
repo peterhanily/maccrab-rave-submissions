@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""
+maccrab-rave-stamp-release — stamp a built release's reproducibility anchors
+into a catalog entry (the Stage-3 "writeback").
+
+This is the operator step that fills the ZERO placeholder hashes of a catalog
+version with the REAL values computed from the built artifact, when a release is
+cut. It is deliberately OPERATOR-DRIVEN, not CI-driven: the catalog must be
+re-signed by the offline catalog key after stamping, and CI never holds that key.
+CI's role is VERIFICATION — .github/workflows/rave-rebuild-and-verify.yml runs the
+SAME canonical-hash comparison against exactly the values this tool stamps.
+
+Computes and writes into catalog/<plugin-id>.json versions[<version>]:
+  * artifact_sha256        raw SHA-256 of the distributed .maccrabplugin.zip
+                           (the transport anchor the client verifies on download)
+  * canonical_tree_sha256  the Mach-O-aware content hash from
+                           maccrab-rave-canonical-hash (the source==binary anchor)
+  * manifest_sha256        SHA-256 of <id>/manifest.json inside the bundle
+  * signature_sha256       SHA-256 of <id>/signature inside the bundle
+                           (the two defense-in-depth digest pins the catalog page
+                           and /docs/verification compare the download against)
+  * reproducibility        optionally set (e.g. "verified") once a double-build /
+                           rebuild-and-verify has confirmed determinism
+
+Fail-closed:
+  * the entry AND the named version block must already exist (never creates one)
+  * the artifact file must exist and be a readable .zip
+  * REFUSES to overwrite an already-real (non-zero) hash unless --force — a signed
+    release's anchors must not be silently re-pointed at different bytes
+  * does NOT sign and does NOT flip status to "active": stamping, signing
+    (maccrab-rave-sign --expect-hashes), and activation are separate ceremony steps
+
+The ceremony, end to end:
+  build -> stamp-release (this) -> review approves the stamped hashes
+        -> maccrab-rave-sign --expect-hashes <approved-manifest>   (reviewed == signed)
+        -> verify-catalog-signatures (deploy gate: official => real hashes)
+        -> rave-rebuild-and-verify (CI: independent reproducible rebuild)
+
+Usage:
+  maccrab-rave-stamp-release --rave-dir rave --plugin-id <id> --version <v> \
+      --artifact path/to/<id>.maccrabplugin.zip [--reproducibility verified] [--force]
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+ZERO_SHA256 = "0" * 64
+
+
+def is_real_sha256(value) -> bool:
+    """A present, 64-char lowercase-hex, non-all-zero SHA-256."""
+    if not isinstance(value, str):
+        return False
+    v = value.strip().lower()
+    if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
+        return False
+    return v != ZERO_SHA256
+
+
+def artifact_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def canonical_tree_sha256(tools_dir: Path, artifact: Path) -> str:
+    """Shell out to the sibling Mach-O-aware canonical-hash tool so the value we
+    stamp is IDENTICAL to what rave-rebuild-and-verify recomputes."""
+    tool = tools_dir / "maccrab-rave-canonical-hash"
+    if not tool.exists():
+        print(f"error: canonical-hash tool not found at {tool}", file=sys.stderr)
+        sys.exit(2)
+    out = subprocess.run(
+        [sys.executable, str(tool), str(artifact)],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        print(f"error: canonical-hash failed:\n{out.stderr}", file=sys.stderr)
+        sys.exit(2)
+    h = out.stdout.strip()
+    if not is_real_sha256(h):
+        print(f"error: canonical-hash returned a non-hash value: {h!r}", file=sys.stderr)
+        sys.exit(2)
+    return h
+
+
+def bundle_member_sha256(artifact: Path, plugin_id: str, leaf: str) -> str:
+    """SHA-256 of a file inside the .maccrabplugin.zip. Bundles nest their files
+    under a top-level <plugin-id>/ directory; fall back to a suffix match so a
+    flat bundle layout still resolves."""
+    with zipfile.ZipFile(artifact) as z:
+        names = z.namelist()
+        for cand in (f"{plugin_id}/{leaf}", leaf):
+            if cand in names:
+                return hashlib.sha256(z.read(cand)).hexdigest()
+        for n in names:
+            if n == leaf or n.endswith("/" + leaf):
+                return hashlib.sha256(z.read(n)).hexdigest()
+    print(f"error: {leaf} not found inside {artifact}", file=sys.stderr)
+    sys.exit(2)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="maccrab-rave-stamp-release", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--rave-dir", required=True, type=Path, help="the rave/ repo dir (holds catalog/ and tools/)")
+    p.add_argument("--plugin-id", required=True, help="catalog id, e.g. com.maccrab.forensics.mail")
+    p.add_argument("--version", required=True, help="the versions[] key to stamp, e.g. 1.0.0")
+    p.add_argument("--artifact", required=True, type=Path, help="the built .maccrabplugin.zip")
+    p.add_argument("--reproducibility", default=None,
+                   help="optional: set the version's reproducibility field (e.g. 'verified')")
+    p.add_argument("--force", action="store_true",
+                   help="allow overwriting an already-real (non-zero) hash (DANGEROUS)")
+    args = p.parse_args()
+
+    rave: Path = args.rave_dir
+    entry_path = rave / "catalog" / f"{args.plugin_id}.json"
+    if not entry_path.exists():
+        print(f"error: catalog entry not found: {entry_path}", file=sys.stderr)
+        return 2
+    if not args.artifact.exists():
+        print(f"error: artifact not found: {args.artifact}", file=sys.stderr)
+        return 2
+
+    try:
+        entry = json.loads(entry_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"error: could not read entry: {exc}", file=sys.stderr)
+        return 2
+
+    versions = entry.get("versions")
+    if not isinstance(versions, dict) or args.version not in versions:
+        print(f"error: version {args.version!r} has no versions[] block in {entry_path}", file=sys.stderr)
+        return 2
+    block = versions[args.version]
+    if not isinstance(block, dict):
+        print(f"error: versions[{args.version!r}] is not an object", file=sys.stderr)
+        return 2
+
+    # Fail-closed: never silently re-point a release that already carries real
+    # anchors (it may already be signed). --force is the explicit override.
+    for field in ("artifact_sha256", "canonical_tree_sha256", "manifest_sha256", "signature_sha256"):
+        if is_real_sha256(block.get(field)) and not args.force:
+            print(f"error: {field} for {args.plugin_id}@{args.version} is already real "
+                  f"({block[field][:12]}…) — refusing to overwrite without --force", file=sys.stderr)
+            return 2
+
+    art = artifact_sha256(args.artifact)
+    can = canonical_tree_sha256(rave / "tools", args.artifact)
+    man = bundle_member_sha256(args.artifact, args.plugin_id, "manifest.json")
+    sig = bundle_member_sha256(args.artifact, args.plugin_id, "signature")
+
+    block["artifact_sha256"] = art
+    block["canonical_tree_sha256"] = can
+    block["manifest_sha256"] = man
+    block["signature_sha256"] = sig
+    if args.reproducibility is not None:
+        block["reproducibility"] = args.reproducibility
+
+    # Match the catalog's on-disk JSON style (2-space indent, escaped non-ASCII,
+    # trailing newline) so the diff is minimal and the operator re-signs clean.
+    entry_path.write_text(json.dumps(entry, indent=2, ensure_ascii=True) + "\n")
+
+    print(f"stamped {args.plugin_id}@{args.version}:")
+    print(f"  artifact_sha256       = {art}")
+    print(f"  canonical_tree_sha256 = {can}")
+    print(f"  manifest_sha256       = {man}")
+    print(f"  signature_sha256      = {sig}")
+    if args.reproducibility is not None:
+        print(f"  reproducibility       = {args.reproducibility}")
+    print("NEXT: review the stamped hashes, then RE-SIGN the catalog with the "
+          "offline key (maccrab-rave-sign --expect-hashes <approved>). Stamping "
+          "does not sign and does not activate.", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+regenerate-catalog — rebuild rave/catalog.json from rave/catalog/*.json.
+
+The master catalog index is the single resource the in-app browser fetches.
+It carries enough per-plugin metadata to render the catalog grid + sidebar
+without a second round-trip per plugin. The full per-plugin entry
+(versions[].artifact_sha256, vetting log, etc.) stays at catalog/<id>.json
+for installs.
+
+Per-plugin summary fields included in the master index:
+  id, display_name, short_description, current_version, channel, runtime,
+  trust_tier, signer_identity, signer_public_key_sha256, kind, privacy_class,
+  requires_encrypted_scan, status, metadata{category, tags,
+  min_maccrab_version, min_macos, max_maccrab_version}
+
+Index-level fields: schema_version (format version) + catalog_serial (signed
+monotonic freshness counter; client rejects a lower serial as stale-catalog
+replay). catalog_serial is read back from the prior catalog.json and +1'd.
+
+After regeneration, the master catalog still needs re-signing:
+  rave/tools/maccrab-rave-sign --key <project.key> rave/catalog.json
+
+Usage:
+    rave/tools/regenerate-catalog              # writes rave/catalog.json in place
+    rave/tools/regenerate-catalog --rave-dir other-rave/
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUMMARY_FIELDS = [
+    "id",
+    "display_name",
+    "short_description",
+    "current_version",
+    "channel",
+    "runtime",
+    "trust_tier",
+    "signer_identity",
+    "signer_public_key_sha256",
+    "kind",
+    "privacy_class",
+    "requires_encrypted_scan",
+    "status",
+]
+
+METADATA_SUMMARY_FIELDS = [
+    "category",
+    "tags",
+    "min_maccrab_version",
+    "max_maccrab_version",
+    "min_macos",
+]
+
+
+def summarize_entry(entry: dict) -> dict:
+    summary: dict = {}
+    for f in SUMMARY_FIELDS:
+        if f in entry:
+            summary[f] = entry[f]
+    metadata = entry.get("metadata") or {}
+    summary_metadata = {
+        f: metadata[f] for f in METADATA_SUMMARY_FIELDS if f in metadata
+    }
+    if summary_metadata:
+        summary["metadata"] = summary_metadata
+    return summary
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument(
+        "--rave-dir",
+        type=Path,
+        default=Path(__file__).resolve().parent.parent,
+        help="Path to the rave/ directory (default: detected from script location)",
+    )
+    args = parser.parse_args()
+
+    catalog_dir = args.rave_dir / "catalog"
+    output = args.rave_dir / "catalog.json"
+
+    if not catalog_dir.is_dir():
+        print(f"error: {catalog_dir} not found", file=sys.stderr)
+        return 2
+
+    entries: dict[str, dict] = {}
+    for entry_path in sorted(catalog_dir.glob("*.json")):
+        try:
+            entry = json.loads(entry_path.read_text())
+        except Exception as exc:
+            print(f"error: {entry_path}: {exc}", file=sys.stderr)
+            return 2
+        plugin_id = entry.get("id")
+        if not plugin_id:
+            print(f"error: {entry_path}: missing 'id'", file=sys.stderr)
+            return 2
+        # Fail closed on a duplicate id: two source files claiming the same id
+        # would otherwise silently overwrite each other (one source dropped from
+        # the index with no error) — a completeness violation. Abort instead.
+        if plugin_id in entries:
+            print(f"error: {entry_path}: duplicate id '{plugin_id}' "
+                  f"(already defined by another catalog/ source)", file=sys.stderr)
+            return 2
+        entries[plugin_id] = summarize_entry(entry)
+
+    # Monotonic catalog_serial: read the prior signed catalog.json (if any) and
+    # increment. Signed + strictly-increasing → the client rejects a stale or
+    # rolled-back catalog as a replay (PLATFORM-VISION keystone). Treat a
+    # missing/garbage prior value as -1 so the first regeneration lands serial 0.
+    prev_serial = -1
+    if output.exists():
+        try:
+            prev = json.loads(output.read_text())
+            if isinstance(prev.get("catalog_serial"), int):
+                prev_serial = prev["catalog_serial"]
+        except Exception:
+            pass
+    catalog_serial = prev_serial + 1
+
+    output_data = {
+        "$schema": "https://rave.maccrab.com/schemas/catalog.json",
+        "schema_version": "1",
+        "catalog_serial": catalog_serial,
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "count": len(entries),
+        "plugins": entries,
+    }
+
+    serialized = json.dumps(output_data, indent=2, sort_keys=False) + "\n"
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    tmp.write_text(serialized)
+    tmp.replace(output)
+
+    print(f"wrote {output}: {len(entries)} plugins")
+    print("re-sign with: tools/maccrab-rave-sign --key <project-key> catalog.json")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

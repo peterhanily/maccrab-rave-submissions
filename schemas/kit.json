@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rave.maccrab.com/schemas/kit.json",
+  "title": "MacCrab Rave Kit (v0)",
+  "description": "Schema for a .maccrabkit — a curated bundle of plugins for a specific operator scenario. Per plan §9.3. Kit trust tier is computed as min(plugin.trust_tier for plugin in plugins).",
+  "type": "object",
+  "required": ["id", "name", "description", "version", "maintainer", "plugins", "category", "min_maccrab_version"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema reference for IDE autocomplete."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)*\\.kit\\.[a-z][a-z0-9_-]*$",
+      "description": "Reverse-DNS kit identifier with `.kit.` segment. Globally unique across the rave catalog. Example: com.maccrab.kit.ir-quick."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 60
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "Operator-facing description of what scenario this kit serves. Length-capped for the same reason manifest description is (plan §11 A8 prompt-injection surface)."
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9-]+)?$"
+    },
+    "maintainer": {
+      "type": "string",
+      "description": "Display name or handle of the kit maintainer. First-party kits use `MacCrab`."
+    },
+    "category": {
+      "type": "string",
+      "enum": ["incident-response", "audit", "posture", "triage", "monitoring", "compliance", "research"]
+    },
+    "min_maccrab_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "plugins": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["plugin_id", "min_version", "role"],
+        "additionalProperties": false,
+        "properties": {
+          "plugin_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*(\\.[a-z][a-z0-9_-]*)+$",
+            "description": "Reverse-DNS plugin id; must exist in rave/catalog/<id>.json"
+          },
+          "min_version": {
+            "type": "string",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "role": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "One-sentence explanation of why this plugin is in this kit"
+          },
+          "required": {
+            "type": "boolean",
+            "default": true,
+            "description": "If false, the kit is functional without this plugin but it adds value"
+          }
+        }
+      }
+    },
+    "trust_tier": {
+      "type": "string",
+      "enum": ["first-party", "verified-community", "unverified"],
+      "description": "Computed: minimum trust tier across all member plugins. Rendered at the catalog browser; not authoritative (the per-plugin tier is the truth)."
+    },
+    "encrypted": {
+      "type": "boolean",
+      "description": "True if any member plugin requires an encrypted scan (privacy_class personal-comms/content). Surfaced as a kit-level pill. Kits are Ed25519-signed via a detached .sig against catalog.pub (not an embedded hash)."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date"
+    }
+  }
+}

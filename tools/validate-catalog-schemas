@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""
+validate-catalog-schemas — validate EVERY catalog artifact against its JSON
+Schema: the master index (catalog.json), each per-plugin entry (catalog/*.json),
+each kit (kits/*.json), and revocations.json. Exits non-zero on any failure.
+
+This closes the schema-drift gap where the aggregate + kit schemas were never
+CI-validated (the per-entry schema was, but catalog.json and kits/*.json were
+not, so schemas/catalog.json + schemas/kit.json silently went stale).
+
+Usage:
+    rave/tools/validate-catalog-schemas --rave-dir rave
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+try:
+    import jsonschema
+except ImportError:
+    print("error: python 'jsonschema' package required (pip install jsonschema)", file=sys.stderr)
+    sys.exit(2)
+
+
+def validate(data_path: Path, schema_path: Path, rave: Path) -> int:
+    schema = json.loads(schema_path.read_text())
+    # Enforce `format` (uri / uri-template / date / date-time) instead of treating
+    # it as a bare annotation — Draft 2020-12 only validates format when a checker
+    # is supplied. jsonschema activates only the format checks whose optional libs
+    # are installed, so this is a no-op for formats lacking a backend (never a new
+    # failure) but makes the anchored `pattern`s the load-bearing guard regardless.
+    validator = jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+    )
+    data = json.loads(data_path.read_text())
+    fails = 0
+    rel = data_path.relative_to(rave.parent)
+    for err in validator.iter_errors(data):
+        loc = ".".join(map(str, err.absolute_path)) or "(root)"
+        print(f"::error file={rel}::{err.message} (at {loc}) [schema {schema_path.name}]")
+        fails += 1
+    return fails
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rave-dir", default=str(Path(__file__).resolve().parent.parent))
+    args = ap.parse_args()
+    rave = Path(args.rave_dir).resolve()
+    schemas = rave / "schemas"
+
+    pairs: list[tuple[Path, Path]] = []
+    if (rave / "catalog.json").exists():
+        pairs.append((rave / "catalog.json", schemas / "catalog.json"))
+    if (rave / "revocations.json").exists():
+        pairs.append((rave / "revocations.json", schemas / "revocation.json"))
+    pairs += [(p, schemas / "catalog-entry.json") for p in sorted((rave / "catalog").glob("*.json"))]
+    pairs += [(p, schemas / "kit.json") for p in sorted((rave / "kits").glob("*.json"))]
+    # First-party plugin manifests (the in-repo draft + any built bundle manifest)
+    # against the manifest schema — closes the gap where plugins/*/manifest were
+    # never schema-checked (e.g. the posture-pro kind:collector field).
+    pairs += [(p, schemas / "manifest.json") for p in sorted((rave / "plugins").glob("*/manifest.draft.json"))]
+    pairs += [(p, schemas / "manifest.json") for p in sorted((rave / "plugins").glob("*/manifest.json"))]
+
+    fails = 0
+    for data_path, schema_path in pairs:
+        fails += validate(data_path, schema_path, rave)
+
+    print(f"validate-catalog-schemas: {len(pairs)} files checked, {fails} schema violations")
+    if fails:
+        print("::error::catalog schema validation FAILED")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

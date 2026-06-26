@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+maccrab-rave-canonical-hash — compute the canonical tree hash for a
+.maccrabplugin artifact.
+
+Operators use this tool to independently verify that an installed plugin
+was built reproducibly from its declared source. The catalog records the
+canonical hash per version; if your local rebuild produces the same hash,
+the binary is byte-equivalent (modulo per-build non-determinism) to what
+the catalog approved.
+
+The canonical hash is content-only and Mach-O-aware:
+
+  * Code signatures + notarization tickets are stripped before hashing
+  * Mach-O binaries get their UUID + ad-hoc signature + debug symbol
+    references normalized via `codesign --remove-signature` and `strip -S`
+  * Filenames are sorted lexicographically; the manifest is hashed
+
+This combination makes the hash stable across rebuilds of unchanged source
+on the same macOS / Swift toolchain. Cross-toolchain reproducibility is a
+separate question (see plan §3.7).
+
+Usage:
+    maccrab-rave-canonical-hash [--verbose] [--json] <archive.maccrabplugin.zip>
+
+Output:
+    Hex SHA-256 (default), or JSON object with --json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+__version__ = "0.1.0-prototype"
+
+EXCLUDED_PREFIXES = ("_CodeSignature/",)
+EXCLUDED_SUFFIXES = ("/CodeResources", ".notarization")
+
+MACHO_MAGICS = (
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+)
+
+
+def is_excluded(name: str) -> bool:
+    if any(prefix in name for prefix in EXCLUDED_PREFIXES):
+        return True
+    if any(name.endswith(suffix) for suffix in EXCLUDED_SUFFIXES):
+        return True
+    return False
+
+
+def is_macho(content: bytes) -> bool:
+    return len(content) >= 4 and content[:4] in MACHO_MAGICS
+
+
+# Mach-O magics (thin: host + byte-swapped, 32/64-bit) and FAT magics (always
+# big-endian on disk). LC_UUID is the load command whose 16-byte uuid the linker
+# randomizes per build — codesign --remove-signature and strip -S do NOT touch it.
+_MH_MAGICS_LE = (0xFEEDFACE, 0xFEEDFACF)
+_MH_MAGICS_BE = (0xCEFAEDFE, 0xCFFAEDFE)
+_MH_64 = (0xFEEDFACF, 0xCFFAEDFE)
+_FAT_MAGIC = 0xCAFEBABE
+_FAT_MAGIC_64 = 0xCAFEBABF
+_LC_UUID = 0x1B
+
+
+def _zero_thin_macho_uuids(content: bytes) -> bytes:
+    """Zero every LC_UUID uuid field in ONE thin Mach-O slice. Parses the header +
+    load commands (not a byte scan), so ONLY genuine LC_UUID commands are touched."""
+    if len(content) < 28:
+        return content
+    magic = struct.unpack_from("<I", content, 0)[0]
+    if magic in _MH_MAGICS_LE:
+        endian = "<"
+    elif magic in _MH_MAGICS_BE:
+        endian = ">"
+    else:
+        return content
+    is64 = magic in _MH_64
+    buf = bytearray(content)
+    ncmds = struct.unpack_from(endian + "I", buf, 16)[0]
+    off = 32 if is64 else 28
+    for _ in range(ncmds):
+        if off + 8 > len(buf):
+            break
+        cmd, cmdsize = struct.unpack_from(endian + "II", buf, off)
+        if cmdsize < 8 or off + cmdsize > len(buf):
+            break
+        if cmd == _LC_UUID and cmdsize >= 24:
+            buf[off + 8: off + 24] = b"\x00" * 16
+        off += cmdsize
+    return bytes(buf)
+
+
+def _zero_macho_uuids(content: bytes) -> bytes:
+    """Zero the per-build LC_UUID across a thin OR FAT (universal) Mach-O, so two
+    reproducible builds of identical source hash equal (the UUID is the only
+    remaining per-build variance once the signature + debug symbols are stripped).
+    Content-preserving + parse-based: only genuine LC_UUID uuid bytes are cleared.
+    Unparseable / non-Mach-O input is returned unchanged (fail-safe; never raises)."""
+    if len(content) < 8:
+        return content
+    try:
+        magic_be = struct.unpack_from(">I", content, 0)[0]
+        if magic_be in (_FAT_MAGIC, _FAT_MAGIC_64):  # fat header is big-endian
+            is64 = magic_be == _FAT_MAGIC_64
+            nfat = struct.unpack_from(">I", content, 4)[0]
+            buf = bytearray(content)
+            pos = 8
+            for _ in range(nfat):
+                if is64:
+                    if pos + 32 > len(buf):
+                        break
+                    sl_off = struct.unpack_from(">Q", buf, pos + 8)[0]
+                    sl_size = struct.unpack_from(">Q", buf, pos + 16)[0]
+                    pos += 32
+                else:
+                    if pos + 20 > len(buf):
+                        break
+                    sl_off = struct.unpack_from(">I", buf, pos + 8)[0]
+                    sl_size = struct.unpack_from(">I", buf, pos + 12)[0]
+                    pos += 20
+                if sl_off >= 0 and sl_off + sl_size <= len(buf):
+                    buf[sl_off:sl_off + sl_size] = _zero_thin_macho_uuids(
+                        bytes(buf[sl_off:sl_off + sl_size]))
+            return bytes(buf)
+        return _zero_thin_macho_uuids(content)
+    except (struct.error, IndexError):
+        return content
+
+
+def normalize_macho(content: bytes) -> bytes:
+    """Strip per-build variant fields from a Mach-O for hashing: code signature
+    (codesign --remove-signature), debug symbols (strip -S), AND the per-build
+    LC_UUID (zeroed in-process — codesign/strip do NOT touch it). Without the UUID
+    step two identical-source rebuilds always differed, so reproducibility could
+    never be stamped 'verified'."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
+    try:
+        tmp.write(content)
+        tmp.close()
+        try:
+            subprocess.run(
+                ["codesign", "--remove-signature", tmp.name],
+                check=False, capture_output=True,
+            )
+        except FileNotFoundError:
+            print("warning: codesign not available; signature not stripped", file=sys.stderr)
+        try:
+            subprocess.run(
+                ["strip", "-S", tmp.name],
+                check=False, capture_output=True,
+            )
+        except FileNotFoundError:
+            print("warning: strip not available; debug refs not removed", file=sys.stderr)
+        with open(tmp.name, "rb") as f:
+            return _zero_macho_uuids(f.read())
+    finally:
+        os.unlink(tmp.name)
+
+
+def canonical_hash(archive: Path) -> tuple[str, list[tuple[str, str]]]:
+    """Compute the canonical hash. Returns (hash, per-file manifest)."""
+    if not archive.exists():
+        print(f"error: archive not found: {archive}", file=sys.stderr)
+        sys.exit(2)
+
+    entries: list[tuple[str, str]] = []
+    with zipfile.ZipFile(archive, "r") as zf:
+        for info in zf.infolist():
+            name = info.filename
+            if name.endswith("/") or is_excluded(name):
+                continue
+            with zf.open(info) as f:
+                content = f.read()
+            if is_macho(content):
+                content = normalize_macho(content)
+            entries.append((name, hashlib.sha256(content).hexdigest()))
+
+    entries.sort()
+    manifest = "".join(f"{name}  {h}\n" for name, h in entries).encode("utf-8")
+    return hashlib.sha256(manifest).hexdigest(), entries
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="maccrab-rave-canonical-hash",
+        description="Compute the canonical tree hash for a .maccrabplugin artifact.",
+    )
+    parser.add_argument("archive", type=Path, help="path to .maccrabplugin or .zip archive")
+    parser.add_argument("--verbose", "-v", action="store_true", help="print per-file hashes")
+    parser.add_argument("--json", action="store_true", help="emit JSON output")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args()
+
+    h, entries = canonical_hash(args.archive)
+
+    if args.json:
+        out = {
+            "archive": str(args.archive),
+            "canonical_hash": h,
+            "entries": [{"path": p, "sha256": s} for p, s in entries],
+            "tool_version": __version__,
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    if args.verbose:
+        for name, file_hash in entries:
+            print(f"{name}  {file_hash}", file=sys.stderr)
+    print(h)
+
+
+if __name__ == "__main__":
+    main()
