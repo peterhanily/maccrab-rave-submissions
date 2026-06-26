@@ -66,7 +66,7 @@ jobs:
           PY
 
   stage-2-capability-consistency:
-    name: Stage 2 — capability consistency (heuristic, not enforcement)
+    name: Stage 2 — capability consistency (enforcing)
     runs-on: macos-14
     needs: stage-1-manifest-validation
     timeout-minutes: 20
@@ -115,7 +115,9 @@ jobs:
               gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --depth=20 --no-tags
               (cd "${CLONE_DIR}" && git checkout -q "${SOURCE_COMMIT}" 2>/dev/null || echo "warn: could not checkout ${SOURCE_COMMIT}, scanning HEAD")
 
-              REPORT=$(python3 tools/stage2-capability-consistency.py "${CLONE_DIR}" 2>/dev/null || true)
+              # Pass the PR's catalog entry so the exact privacy_class <->
+              # requires_encrypted_scan coupling is enforced against the source's manifest.
+              REPORT=$(python3 tools/stage2-capability-consistency.py "${CLONE_DIR}" --entry "${ENTRY}" 2>/dev/null || true)
               FAILS=$(echo "${REPORT}" | jq -r '.fail_count // 0')
               WARNS=$(echo "${REPORT}" | jq -r '.warn_count // 0')
               FILES=$(echo "${REPORT}" | jq -r '.swift_files_scanned // 0')
@@ -148,6 +150,27 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Pin the build toolchain (fail closed on drift)
+        # Reproducibility (the canonical hash compared below) is only meaningful
+        # against a FIXED toolchain — an unpinned Xcode silently changes the build
+        # output and breaks every rebuild. Authors must build their submission with
+        # this same Xcode. Bump XCODE_VERSION deliberately (and re-baseline approved
+        # canonical hashes) when moving the floor; never let it float.
+        env:
+          XCODE_VERSION: "15.4"
+        run: |
+          set -e
+          XC="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+          if [[ ! -d "${XC}" ]]; then
+              echo "::error::pinned Xcode ${XCODE_VERSION} is not on this runner image — toolchain drift. Available:"
+              ls -d /Applications/Xcode_*.app 2>/dev/null || true
+              exit 1
+          fi
+          sudo xcode-select -s "${XC}"
+          echo "DEVELOPER_DIR=${XC}" >> "${GITHUB_ENV}"
+          echo "pinned toolchain:"
+          DEVELOPER_DIR="${XC}" swift --version
 
       - name: Identify the catalog entry changed in this PR
         id: changed
@@ -213,15 +236,14 @@ jobs:
                   exit 1
               fi
 
-              # Authors are expected to provide scripts/package-plugin.sh at the
-              # path the plugin template establishes. A different build layout is
-              # non-standard and fails closed (needs manual review).
-              if [[ ! -x "${CLONE_DIR}/source-rebuild/scripts/package-plugin.sh" ]]; then
-                  echo "::error::${PLUGIN_ID}: source repo missing executable scripts/package-plugin.sh — non-standard build layout"
-                  exit 1
-              fi
-              if ! (cd "${CLONE_DIR}/source-rebuild" && ./scripts/package-plugin.sh); then
-                  echo "::error::${PLUGIN_ID}: scripts/package-plugin.sh failed"
+              # Build from source HERMETICALLY (plan §10): pinned toolchain (above),
+              # pinned dependencies, and NO network egress (the author build runs in
+              # a Seatbelt no-network sandbox). The wrapper fails closed on a
+              # non-standard layout, a missing/stale Package.resolved, any build-time
+              # network access, or a compile error — so a malicious build script can
+              # neither fetch code at build time nor pull an unvetted dependency.
+              if ! tools/hermetic-build.sh "${CLONE_DIR}/source-rebuild"; then
+                  echo "::error::${PLUGIN_ID}: hermetic build failed (missing build script, unpinned deps, build-time network, or compile error — see log)"
                   exit 1
               fi
 

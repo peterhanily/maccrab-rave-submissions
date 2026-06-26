@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stage 2 — capability consistency (heuristic).
+Stage 2 — capability consistency (enforcing; source-side checks heuristic).
 
 Walks a plugin source tree and checks whether what the source actually does
 matches what the manifest declares. This is a HEURISTIC layer (per plan
@@ -10,14 +10,23 @@ for manual review.
 
 Checks performed:
 
-  1. URL endpoints in source vs manifest.capabilities.endpoints
-  2. Process / posix_spawn / NSTask call sites vs manifest.capabilities.subprocesses
+  1. URL endpoints in source vs manifest.networkConnectAllowlist
+  2. Process / posix_spawn / NSTask call sites vs manifest.processExecPaths
   3. SPDX license header presence on .swift files
   4. Hardcoded URLs pointing at author-controlled download domains (anti-pattern)
   5. Common secret patterns (Gitleaks-style regex; not a replacement for Gitleaks)
+  6. (with --entry) catalog privacy_class <-> requires_encrypted_scan coupling:
+     a sensitive class (personal-comms / content) MUST carry the encrypted-scan
+     flag. /api/submit synthesizes this, but a hand-edited catalog PR could ship
+     `content` with the flag off and have the app treat it as plaintext-scannable.
+
+The source-vs-manifest checks (1, 2, 4) are heuristic (regex over .swift); the
+manifest/catalog coupling check (6) is exact. A declared capability that the
+source actually exercises but the manifest omits is a FAIL — so the manifest is
+the binding contract, not advisory.
 
 Usage:
-    stage2-capability-consistency.py <plugin-source-tree>
+    stage2-capability-consistency.py <plugin-source-tree> [--entry catalog/<id>.json]
 
 Exits 0 if no FAILs (warns are OK). Exits 1 if any FAIL.
 Always emits a JSON report on stdout for the CI workflow to render in the
@@ -34,7 +43,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.1.0-prototype"
+__version__ = "1.0.0"
 
 
 @dataclass
@@ -92,7 +101,10 @@ def swift_sources(source: Path) -> list[Path]:
 
 
 def check_url_endpoints(swift_files: list[Path], manifest: dict[str, Any]) -> list[Finding]:
-    declared_hosts = {ep["host"] for ep in manifest.get("capabilities", {}).get("endpoints", [])}
+    # Flat v1 manifest: networkConnectAllowlist is a list of allowed hosts (host or
+    # host:port). (Was reading the nested v0 capabilities.endpoints, which never
+    # exists in v1 — so the declared set was always empty and every URL false-flagged.)
+    declared_hosts = {str(h).split(":")[0].lower() for h in manifest.get("networkConnectAllowlist", [])}
     findings: list[Finding] = []
     for path in swift_files:
         for lineno, line in enumerate(path.read_text(errors="replace").splitlines(), start=1):
@@ -106,7 +118,7 @@ def check_url_endpoints(swift_files: list[Path], manifest: dict[str, Any]) -> li
                     continue
                 # Suspicious-host check is harder than declared/undeclared
                 severity = "warn"
-                detail = f"URL host '{host}' not in manifest.endpoints"
+                detail = f"URL host '{host}' not in manifest.networkConnectAllowlist"
                 if SUSPICIOUS_DOWNLOAD_HOSTS.search(host):
                     severity = "fail"
                     detail += " (author-controlled-download pattern — anti-pattern)"
@@ -119,7 +131,11 @@ def check_url_endpoints(swift_files: list[Path], manifest: dict[str, Any]) -> li
 
 
 def check_subprocess_calls(swift_files: list[Path], manifest: dict[str, Any]) -> list[Finding]:
-    declared_execs = {sp["executable"] for sp in manifest.get("capabilities", {}).get("subprocesses", [])}
+    # Flat v1 manifest: processExecPaths is a list of allowed absolute exec paths.
+    # (Was reading nested v0 capabilities.subprocesses, always empty in v1 — so a
+    # plugin that legitimately declared its execs was still failed, and the
+    # declared/undeclared distinction never actually bound to the manifest.)
+    declared_execs = set(manifest.get("processExecPaths", []))
     findings: list[Finding] = []
     for path in swift_files:
         text = path.read_text(errors="replace")
@@ -131,7 +147,7 @@ def check_subprocess_calls(swift_files: list[Path], manifest: dict[str, Any]) ->
                     findings.append(Finding(
                         severity="fail", check="subprocess-call",
                         file=str(path), line=lineno,
-                        detail=f"Process.executableURL targets '{exe}' not in manifest.subprocesses",
+                        detail=f"Process.executableURL targets '{exe}' not in manifest.processExecPaths",
                     ))
             for match in POSIX_SPAWN_PATTERN.finditer(line):
                 exe = match.group(1)
@@ -139,7 +155,7 @@ def check_subprocess_calls(swift_files: list[Path], manifest: dict[str, Any]) ->
                     findings.append(Finding(
                         severity="fail", check="subprocess-call",
                         file=str(path), line=lineno,
-                        detail=f"posix_spawn targets '{exe}' not in manifest.subprocesses",
+                        detail=f"posix_spawn targets '{exe}' not in manifest.processExecPaths",
                     ))
             if NSTASK_PATTERN.search(line) and not declared_execs:
                 findings.append(Finding(
@@ -189,9 +205,43 @@ def check_secrets(source: Path) -> list[Finding]:
     return findings
 
 
+PRIVACY_CLASSES = ("metadata", "personal-comms", "content")
+
+
+def check_privacy_coupling(entry: dict[str, Any]) -> list[Finding]:
+    """Exact catalog-entry invariant: requires_encrypted_scan == (privacy_class != metadata).
+
+    Mirrors the synthesis rule in api/_lib/submission.js so a hand-edited catalog PR
+    (which never went through /api/submit) can't ship a sensitive class with the
+    encrypted-scan opt-in disabled. entity is the catalog entry, not the manifest.
+    """
+    findings: list[Finding] = []
+    pc = entry.get("privacy_class")
+    if pc not in PRIVACY_CLASSES:
+        findings.append(Finding(
+            severity="fail", check="privacy-class",
+            file="catalog-entry", line=0,
+            detail=f"privacy_class {pc!r} is not one of {PRIVACY_CLASSES}",
+        ))
+        return findings
+    expected = pc != "metadata"
+    actual = bool(entry.get("requires_encrypted_scan", False))
+    if actual != expected:
+        findings.append(Finding(
+            severity="fail", check="privacy-class",
+            file="catalog-entry", line=0,
+            detail=(f"requires_encrypted_scan={actual} contradicts privacy_class={pc!r} "
+                    f"(expected {expected}); a {pc} plugin must "
+                    f"{'require' if expected else 'not require'} encrypted-scan opt-in"),
+        ))
+    return findings
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("source", type=Path, help="plugin source tree to analyze")
+    parser.add_argument("--entry", type=Path, default=None,
+                        help="catalog entry JSON for the privacy_class coupling check")
     parser.add_argument("--json", action="store_true", help="emit JSON only (no human prose)")
     args = parser.parse_args()
 
@@ -210,6 +260,11 @@ def main() -> None:
     findings += check_subprocess_calls(sources, manifest)
     findings += check_spdx_headers(sources)
     findings += check_secrets(args.source)
+    if args.entry is not None:
+        if not args.entry.is_file():
+            print(f"error: --entry path is not a file: {args.entry}", file=sys.stderr)
+            sys.exit(2)
+        findings += check_privacy_coupling(json.loads(args.entry.read_text()))
 
     fails = [f for f in findings if f.severity == "fail"]
     warns = [f for f in findings if f.severity == "warn"]

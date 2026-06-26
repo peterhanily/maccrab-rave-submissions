@@ -3,8 +3,11 @@
 reconcile-catalog — emit idempotent SQL that mirrors the signed static catalog
 into the D1 CACHE tables (plugins, plugin_tags, plugin_versions, kits,
 kit_plugins, revocations). One-way: catalog -> D1. Signed bytes are authority;
-this never writes back to the catalog and never touches AUTH tables
-(submissions, users, counters, screenshots, featured, reports, is_listed).
+this never writes back to the catalog and does not touch AUTH tables (users,
+counters, screenshots, featured, reports, is_listed) — with ONE catalog-driven
+exception: it advances a submission from pending_sign -> published once its version
+is the live, signed current_version (completing the submission state machine so D1
+stops reporting a published plugin as perpetually pending).
 
 Runs the publication trust gate (verify-catalog-signatures) FIRST and refuses
 to emit anything if a signature is missing/invalid — so an unsigned entry never
@@ -114,6 +117,14 @@ def main() -> int:
                 f"{q(vd.get('artifact_sha256'))}, {q(vd.get('canonical_tree_sha256'))}, "
                 f"{q(vd.get('manifest_sha256'))}, {q(vd.get('signature_sha256'))}, "
                 f"{q(vd.get('reproducibility'))}, {q(vet.get('vetted_at'))}, {q(vet.get('vetting_policy_commit'))});"
+            )
+        # Advance the in-flight submission for the now-published current version to
+        # 'published' (closes the pending_sign limbo). Catalog-driven; touches only
+        # pending_sign rows for this plugin's published version.
+        if cols["status"] == "active" and cols["current_version"]:
+            out.append(
+                f"UPDATE submissions SET state='published', updated_at=unixepoch() "
+                f"WHERE plugin_id={q(pid)} AND version={q(cols['current_version'])} AND state='pending_sign';"
             )
 
     # ---- kits (+ kit_plugins) ----
