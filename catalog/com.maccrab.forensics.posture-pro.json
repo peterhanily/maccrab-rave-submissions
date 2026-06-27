@@ -41,7 +41,7 @@
   "sample_output": [
     {
       "content_type": "posture.factor",
-      "caption": "One emitted TierBOutputLine \u2014 an unsigned launchd persistence finding (the security payoff). Metadata only.",
+      "caption": "One emitted output line \u2014 an unsigned launchd persistence finding (the security payoff). Metadata only.",
       "example": "{\"kind\":\"artifact\",\"artifact\":{\"contentType\":\"posture.factor\",\"summary\":\"Launchd persistence integrity: fail\",\"privacyClass\":\"metadata\",\"confidence\":\"observed\",\"data\":{\"key\":\"persistence\",\"title\":\"Launchd persistence integrity\",\"status\":\"fail\",\"weight\":12,\"detail\":\"Scanned 10 launchd item(s); 1 unsigned / ad-hoc / script / unverifiable.\",\"remediation\":\"Investigate the flagged launchd entries \u2014 unsigned persistence is a common malware foothold.\",\"evidence\":[\"system-daemon: /Library/Application Support/Sketchy/helper [unsigned]\"]}}}"
     }
   ],
@@ -50,7 +50,7 @@
       "tag": "v0.1.0",
       "source_commit": "0000000000000000000000000000000000000000",
       "artifact_sha256": "3a9e964854a076387a3213b1ef12fe4553793f11f35412163dc0a4c2dc9f65c9",
-      "canonical_tree_sha256": "87b213e3b6c64d88003d227a16713eadd4c74d9e84bb71448dbcb425eb595913",
+      "canonical_tree_sha256": "0241baddf7b52997d5b5db96d8cb21de613b4457188876add28a8b32064dfded",
       "manifest_sha256": "98aaae00dd6ceb70f9c46f7c5ebb503c6de0cfed92c1edae0523fdafad036eda",
       "signature_sha256": "6ed6fb14a053a8993a4bfa2c44fa94e05b6ad4297a169ab1e0eed894c3bd3d5e",
       "reproducibility": "verified",

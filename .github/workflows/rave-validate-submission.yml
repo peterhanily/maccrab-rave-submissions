@@ -186,18 +186,26 @@ jobs:
           echo "entries to rebuild:"
           printf '  %s\n' ${CHANGED:-"(none)"}
 
-      - name: Rebuild changed plugin(s) and verify canonical hash
-        # NOTE: needs a real submission-PR smoke test once the contrib channel opens.
+      - name: Rebuild from source + verify the published artifact reproduces
+        # Smoke-tested end to end by the login-items-lite reference submission.
         env:
           CHANGED: ${{ steps.changed.outputs.changed }}
         run: |
-          # Reproducibility check, adapted from rave-rebuild-and-verify.yml:
-          # clone the author source, run their scripts/package-plugin.sh, canonical-
-          # hash the rebuilt zip, and compare to the catalog-pinned
-          # canonical_tree_sha256. Fail-closed on any mismatch / missing field /
-          # clone or build failure, so `vetting-gate` stays un-green and
-          # api/admin/review.js refuses the merge. First-party entries are added by
-          # the owner directly and never flow through this gate.
+          # Independent reproducibility + provenance gate (plan §4.4 / §10). For each
+          # changed entry: resolve the source commit, rebuild from source HERMETICALLY
+          # (pinned toolchain above, no network egress), and prove the PUBLISHED signed
+          # release artifact reproduces (canonically) from that source. Two modes:
+          #   * RECORD  — a fresh submission carries a ZERO source_commit / canonical
+          #     hash (filled later by the offline stamp ceremony). Resolve the commit
+          #     from the release tag, rebuild, and RECORD the derived commit + hash for
+          #     the reviewer/stamper. This untrusted-PR job never writes the signed
+          #     catalog — pinning happens in the owner's offline ceremony.
+          #   * ENFORCE — an entry that already pins real values is re-verified against
+          #     them (drift / compromise guard).
+          # Either way the PUBLISHED artifact MUST equal the hermetic rebuild. Fail
+          # closed on any mismatch / missing field / clone, resolve, download or build
+          # failure, so `vetting-gate` stays un-green and review.js refuses the merge.
+          # First-party entries are added by the owner directly and skip this gate.
           set -e
           if [[ -z "${CHANGED}" ]]; then
               echo "no catalog entries changed — nothing to rebuild (workflow_dispatch no-op)"
@@ -209,68 +217,103 @@ jobs:
               PLUGIN_ID=$(jq -r '.id' "${ENTRY}")
               SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
               VERSION=$(jq -r '.current_version' "${ENTRY}")
+              TAG=$(jq -r --arg v "${VERSION}" '.versions[$v].tag // .approved_at_tag // empty' "${ENTRY}")
               SOURCE_COMMIT=$(jq -r --arg v "${VERSION}" '.versions[$v].source_commit' "${ENTRY}")
               CANONICAL_SHA=$(jq -r --arg v "${VERSION}" '.versions[$v].canonical_tree_sha256' "${ENTRY}")
+              SLUG="${SOURCE_REPO#https://github.com/}"
 
-              echo "==> rebuilding ${PLUGIN_ID} v${VERSION} (${SOURCE_REPO}@${SOURCE_COMMIT:0:8})"
-
-              # Fail closed on any missing field — a contrib entry MUST pin its
-              # source and the canonical hash to be independently reproducible.
-              for FIELD in SOURCE_REPO VERSION SOURCE_COMMIT CANONICAL_SHA; do
+              # A submission MUST pin its source repo + release tag; without them the
+              # artifact is not locatable. (commit + canonical hash MAY be zero on a
+              # fresh submission — see RECORD mode below.)
+              for FIELD in PLUGIN_ID SOURCE_REPO VERSION TAG; do
                   VAL="${!FIELD}"
                   if [[ -z "${VAL}" || "${VAL}" == "null" ]]; then
-                      echo "::error::${PLUGIN_ID}: missing/empty ${FIELD} — cannot verify reproducibility"
+                      echo "::error::${PLUGIN_ID:-?}: missing/empty ${FIELD} — cannot verify reproducibility"
                       exit 1
                   fi
               done
 
-              # Clone the author source at the pinned commit. SOURCE_REPO is like
-              # https://github.com/owner/repo.
+              # Mode + commit resolution: a real pinned commit -> ENFORCE; an all-zero
+              # placeholder -> RECORD (resolve the commit from the release tag).
+              if [[ "${SOURCE_COMMIT}" =~ ^0+$ || "${SOURCE_COMMIT}" == "null" ]]; then
+                  MODE="record"
+                  REF=$(gh api "repos/${SLUG}/git/ref/tags/${TAG}" --jq '.object.sha + " " + .object.type' 2>/dev/null || true)
+                  RSHA="${REF% *}"; RTYPE="${REF#* }"
+                  if [[ -z "${RSHA}" ]]; then
+                      echo "::error::${PLUGIN_ID}: could not resolve tag ${TAG} in ${SLUG}"
+                      exit 1
+                  fi
+                  # annotated tag -> dereference to the commit it points at
+                  if [[ "${RTYPE}" == "tag" ]]; then
+                      RSHA=$(gh api "repos/${SLUG}/git/tags/${RSHA}" --jq '.object.sha')
+                  fi
+                  SOURCE_COMMIT="${RSHA}"
+              else
+                  MODE="enforce"
+              fi
+
+              echo "==> ${PLUGIN_ID} v${VERSION} (${SLUG}@${SOURCE_COMMIT:0:8}, ${TAG}, mode=${MODE})"
+
+              # Clone + checkout the resolved/pinned commit (full clone -> commit present).
               CLONE_DIR=$(mktemp -d)
-              if ! gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}/source-rebuild"; then
-                  echo "::error::${PLUGIN_ID}: failed to clone ${SOURCE_REPO}"
-                  exit 1
+              if ! gh repo clone "${SLUG}" "${CLONE_DIR}/source-rebuild"; then
+                  echo "::error::${PLUGIN_ID}: failed to clone ${SOURCE_REPO}"; exit 1
               fi
               if ! (cd "${CLONE_DIR}/source-rebuild" && git checkout "${SOURCE_COMMIT}"); then
-                  echo "::error::${PLUGIN_ID}: could not checkout source_commit ${SOURCE_COMMIT}"
-                  exit 1
+                  echo "::error::${PLUGIN_ID}: could not checkout commit ${SOURCE_COMMIT}"; exit 1
               fi
 
-              # Build from source HERMETICALLY (plan §10): pinned toolchain (above),
-              # pinned dependencies, and NO network egress (the author build runs in
-              # a Seatbelt no-network sandbox). The wrapper fails closed on a
-              # non-standard layout, a missing/stale Package.resolved, any build-time
-              # network access, or a compile error — so a malicious build script can
-              # neither fetch code at build time nor pull an unvetted dependency.
+              # Hermetic rebuild (pinned toolchain above; no network egress). The
+              # wrapper fails closed on a non-standard layout, unpinned deps, any
+              # build-time network access, or a compile error.
               if ! tools/hermetic-build.sh "${CLONE_DIR}/source-rebuild"; then
-                  echo "::error::${PLUGIN_ID}: hermetic build failed (missing build script, unpinned deps, build-time network, or compile error — see log)"
-                  exit 1
+                  echo "::error::${PLUGIN_ID}: hermetic build failed (see log)"; exit 1
               fi
-
-              # Locate the produced .maccrabplugin.zip — author build scripts
-              # conventionally emit it under dist/ or build/.
               REBUILD_ZIP=$(find "${CLONE_DIR}/source-rebuild/dist" "${CLONE_DIR}/source-rebuild/build" -name '*.maccrabplugin.zip' 2>/dev/null | head -1)
               if [[ -z "${REBUILD_ZIP}" ]]; then
-                  echo "::error::${PLUGIN_ID}: could not locate the rebuilt .maccrabplugin.zip"
+                  echo "::error::${PLUGIN_ID}: could not locate the rebuilt .maccrabplugin.zip"; exit 1
+              fi
+              REBUILD_HASH=$(tools/maccrab-rave-canonical-hash "${REBUILD_ZIP}")
+
+              # Download the PUBLISHED signed release artifact and canonical-hash it.
+              # The canonical hash excludes the detached signature/signing.key.pub, so
+              # a faithfully-built signed release hashes identically to the unsigned
+              # rebuild. This binds "what users download" to "what the source builds".
+              DL_DIR=$(mktemp -d)
+              if ! gh release download "${TAG}" --repo "${SLUG}" --pattern '*.maccrabplugin.zip' --dir "${DL_DIR}" 2>/dev/null; then
+                  echo "::error::${PLUGIN_ID}: could not download a *.maccrabplugin.zip asset from release ${TAG}"; exit 1
+              fi
+              PUBLISHED_ZIP=$(find "${DL_DIR}" -name '*.maccrabplugin.zip' | head -1)
+              if [[ -z "${PUBLISHED_ZIP}" ]]; then
+                  echo "::error::${PLUGIN_ID}: release ${TAG} has no *.maccrabplugin.zip asset (nothing to compare against the rebuild)"; exit 1
+              fi
+              PUBLISHED_HASH=$(tools/maccrab-rave-canonical-hash "${PUBLISHED_ZIP}")
+
+              echo "rebuild (source)   : ${REBUILD_HASH}"
+              echo "published (release): ${PUBLISHED_HASH}"
+              if [[ "${REBUILD_HASH}" != "${PUBLISHED_HASH}" ]]; then
+                  echo "::error::${PLUGIN_ID}: PROVENANCE FAILED — the published release artifact does NOT match a hermetic rebuild from source"
                   exit 1
               fi
 
-              REBUILD_HASH=$(tools/maccrab-rave-canonical-hash "${REBUILD_ZIP}")
-              echo "catalog-pinned : ${CANONICAL_SHA}"
-              echo "your rebuild   : ${REBUILD_HASH}"
-              if [[ "${REBUILD_HASH}" != "${CANONICAL_SHA}" ]]; then
-                  echo "::error::${PLUGIN_ID}: REPRODUCIBILITY FAILED — rebuild does not match catalog-pinned canonical hash"
-                  echo "::error::either the catalog entry is wrong/compromised, or this build environment differs from the one it was approved against"
-                  exit 1
+              if [[ "${MODE}" == "enforce" ]]; then
+                  if [[ "${REBUILD_HASH}" != "${CANONICAL_SHA}" ]]; then
+                      echo "::error::${PLUGIN_ID}: REPRODUCIBILITY FAILED — rebuild does not match catalog-pinned canonical hash (entry wrong/compromised, or toolchain drift)"
+                      exit 1
+                  fi
+                  VERDICT="enforced against pinned \`${CANONICAL_SHA}\`"
+              else
+                  VERDICT="recorded (entry pins ZERO; the offline stamp will set source_commit=\`${SOURCE_COMMIT:0:12}…\` canonical=\`${REBUILD_HASH:0:12}…\`)"
               fi
 
               {
-                  echo "## Stage 3 — reproducibility: ${PLUGIN_ID} v${VERSION}"
-                  echo "- Source: \`${SOURCE_REPO}@${SOURCE_COMMIT}\`"
-                  echo "- Catalog-pinned canonical hash: \`${CANONICAL_SHA}\`"
-                  echo "- Rebuild canonical hash: \`${REBUILD_HASH}\` ✓"
+                  echo "## Stage 3 — reproducibility + provenance: ${PLUGIN_ID} v${VERSION}"
+                  echo "- Source: \`${SLUG}@${SOURCE_COMMIT}\` (tag \`${TAG}\`, mode \`${MODE}\`)"
+                  echo "- Rebuild canonical hash: \`${REBUILD_HASH}\`"
+                  echo "- Published artifact matches rebuild: ✓"
+                  echo "- ${VERDICT}"
               } >> "${GITHUB_STEP_SUMMARY}"
-              echo "${PLUGIN_ID}: REPRODUCIBILITY VERIFIED"
+              echo "${PLUGIN_ID}: REPRODUCIBILITY + PROVENANCE VERIFIED (${MODE})"
           done
 
   stage-4-containment-validation:

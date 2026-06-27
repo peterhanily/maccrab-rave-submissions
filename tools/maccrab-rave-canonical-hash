@@ -14,6 +14,11 @@ The canonical hash is content-only and Mach-O-aware:
   * Code signatures + notarization tickets are stripped before hashing
   * Mach-O binaries get their UUID + ad-hoc signature + debug symbol
     references normalized via `codesign --remove-signature` and `strip -S`
+  * the author's DETACHED attestation files (the flat-bundle `signature` +
+    `signing.key.pub`) are excluded — they're produced by the private key AFTER
+    the build, so an independent rebuilder (and CI, which has no key) can never
+    reproduce them. Excluding them is what lets a SIGNED published artifact and
+    an UNSIGNED hermetic rebuild hash identically (the reproducibility property).
   * Filenames are sorted lexicographically; the manifest is hashed
 
 This combination makes the hash stable across rebuilds of unchanged source
@@ -40,10 +45,14 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-__version__ = "0.1.0-prototype"
+__version__ = "1.0.0"
 
 EXCLUDED_PREFIXES = ("_CodeSignature/",)
-EXCLUDED_SUFFIXES = ("/CodeResources", ".notarization")
+# /CodeResources + .notarization: macOS app-bundle code-signing artifacts.
+# /signature + /signing.key.pub: the flat plugin bundle's DETACHED author
+# attestation — added by the private key AFTER the build, so they are NOT part of
+# the reproducible content (excluding them makes signed-published == unsigned-rebuild).
+EXCLUDED_SUFFIXES = ("/CodeResources", ".notarization", "/signature", "/signing.key.pub")
 
 MACHO_MAGICS = (
     b"\xfe\xed\xfa\xce",
