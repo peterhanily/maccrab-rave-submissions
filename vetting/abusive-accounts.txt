@@ -1,0 +1,4 @@
+# No static account entries are configured in this initial list.
+# This is not a statement that any account has been reviewed or cleared.
+# The API account-ban records remain authoritative for submission access.
+# Maintainers may add one exact GitHub login per line after review.

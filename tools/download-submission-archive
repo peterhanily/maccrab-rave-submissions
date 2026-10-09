@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Download one public release archive without credentials in an author-build job.
+
+Used only by CI. Does not extract or execute the archive. Ambiguous/missing
+archives and downloads over 50 MiB fail closed.
+"""
+import argparse
+import json
+import re
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+LIMIT = 50 * 1024 * 1024
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repository")
+    parser.add_argument("tag")
+    parser.add_argument("directory", type=Path)
+    args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+", args.repository) or ".." in args.repository:
+        parser.exit(1, "error: invalid public repository\n")
+    try:
+        tag = urllib.parse.quote(args.tag, safe="")
+        request = urllib.request.Request(f"https://api.github.com/repos/{args.repository}/releases/tags/{tag}", headers={"User-Agent": "rave-vetting"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("release metadata exceeds limit")
+        release = json.loads(raw)
+        assets = [a for a in release.get("assets", []) if a.get("name", "").endswith(".maccrabplugin.zip")]
+        if release.get("draft") or len(assets) != 1:
+            raise ValueError("release must contain exactly one public plugin archive")
+        asset = assets[0]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.maccrabplugin\.zip", asset["name"]) or ".." in asset["name"]:
+            raise ValueError("invalid archive filename")
+        expected = f"https://github.com/{args.repository}/releases/download/{tag}/"
+        if not asset.get("browser_download_url", "").startswith(expected):
+            raise ValueError("archive URL does not belong to the selected GitHub release")
+        if not 0 < asset.get("size", 0) <= LIMIT:
+            raise ValueError("archive size outside the accepted bounds")
+        args.directory.mkdir(parents=True, exist_ok=True)
+        output = args.directory / asset["name"]
+        with urllib.request.urlopen(asset["browser_download_url"], timeout=60) as response, output.open("xb") as target:
+            total = 0
+            while chunk := response.read(64 * 1024):
+                total += len(chunk)
+                if total > LIMIT:
+                    raise ValueError("archive exceeds download limit")
+                target.write(chunk)
+        if total != asset["size"]:
+            raise ValueError("archive size differs from release metadata")
+        print(output)
+    except Exception as exc:
+        parser.exit(1, f"error: public archive download failed: {exc}\n")

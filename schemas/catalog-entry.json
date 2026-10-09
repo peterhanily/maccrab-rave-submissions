@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rave.maccrab.com/schemas/catalog-entry.json",
-  "title": "MacCrab Rave Catalog Entry (v1 — Ed25519 signing model)",
-  "description": "Schema for /rave/catalog/<plugin-id>.json. v1 (per plan v4.5) replaces v0's Sigstore-specific fields (signing_identity_pattern, exact_signer.*, sigstore_bundle_sha256, slsa_attestation_sha256) with Ed25519-specific fields (signer_public_key_sha256, signature_sha256). URLs are transport; digests are identity. Per plan v4.5 §3.2.",
+  "title": "MacCrab Rave Catalog Entry (v1 \u2014 Ed25519 signing model)",
+  "description": "Schema for /rave/catalog/<plugin-id>.json. v1 (per plan v4.5) replaces v0's Sigstore-specific fields (signing_identity_pattern, exact_signer.*, sigstore_bundle_sha256, slsa_attestation_sha256) with Ed25519-specific fields (signer_public_key_sha256, signature_sha256). URLs are transport; digests are identity. Per plan v4.5 \u00a73.2.",
   "type": "object",
   "required": [
     "id",
@@ -53,38 +53,48 @@
     "homepage": {
       "type": "string",
       "format": "uri",
-      "description": "Optional canonical homepage URL — often the plugin's GitHub repo or a project landing page. Distinct from source_repo (which must be a GitHub URL for the verifier)."
+      "description": "Optional canonical homepage URL \u2014 often the plugin's GitHub repo or a project landing page. Distinct from source_repo (which must be a GitHub URL for the verifier)."
     },
     "author": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "name": { "type": "string", "maxLength": 100 },
-        "url":  { "type": "string", "format": "uri", "maxLength": 300 }
+        "name": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "maxLength": 300
+        }
       },
       "description": "Human-facing author identity for the detail page byline. signer_identity remains the load-bearing trust handle."
     },
     "icon": {
       "type": "string",
       "maxLength": 256,
-      "description": "Path under /rave/icons/ to a 256x256 PNG (or SVG). Optional; absent renders a category-colored monogram tile. Path is relative to the rave base; consumers prepend their catalog-base URL."
+      "description": "Relative content-addressed 256x256 PNG path; at most 96 KiB and no text or EXIF chunks. The website may use its editorial SVG instead."
     },
     "screenshots": {
       "type": "array",
       "maxItems": 16,
-      "items": { "type": "string", "maxLength": 256 },
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      },
       "description": "Paths under /rave/screenshots/ to PNG screenshots (rendered output examples or in-MacCrab views). Web detail page lays them out; in-app browser may show in a future version."
     },
     "source_repo": {
       "type": "string",
       "format": "uri",
       "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$",
-      "description": "Optional public-source URL — must be an https://github.com/<owner>/<repo> URL. First-party plugins typically omit this. Community submissions point at the public source repo the build was reproduced from. The anchored pattern is load-bearing: untrusted-PR vetting CI passes this value to `gh repo clone`, so it must never be an arbitrary string or begin with '-' (argument injection)."
+      "description": "Optional public-source URL \u2014 must be an https://github.com/<owner>/<repo> URL. First-party plugins typically omit this. Community submissions point at the public source repo the build was reproduced from. The anchored pattern is load-bearing: untrusted-PR vetting CI passes this value to `gh repo clone`, so it must never be an arbitrary string or begin with '-' (argument injection)."
     },
     "source_owner": {
       "type": "string",
       "maxLength": 100,
-      "description": "Optional. Display-name for the source owner — present only when source_repo is set."
+      "description": "Optional. Display-name for the source owner \u2014 present only when source_repo is set."
     },
     "approved_at_commit": {
       "type": "string",
@@ -95,7 +105,9 @@
     },
     "approved_by_review": {
       "type": "array",
-      "items": { "type": "string" },
+      "items": {
+        "type": "string"
+      },
       "minItems": 1
     },
     "approved_at": {
@@ -104,22 +116,32 @@
     },
     "trust_tier": {
       "type": "string",
-      "enum": ["first-party", "verified-community", "unverified"]
+      "enum": [
+        "first-party",
+        "verified-community",
+        "unverified"
+      ]
     },
     "channel": {
       "type": "string",
-      "enum": ["official", "contrib"]
+      "enum": [
+        "official",
+        "contrib"
+      ]
     },
     "runtime": {
       "type": "string",
-      "enum": ["tierA", "tierB"],
-      "description": "Matches platform's PluginManifest.runtime. All rave-catalog plugins are tierB per plan §6, but the field is explicit for clarity + multi-channel federation."
+      "enum": [
+        "tierA",
+        "tierB"
+      ],
+      "description": "Matches platform's PluginManifest.runtime. All rave-catalog plugins are tierB per plan \u00a76, but the field is explicit for clarity + multi-channel federation."
     },
     "signer_identity": {
       "type": "string",
       "maxLength": 120,
       "pattern": "^[A-Za-z0-9:_./@-]+$",
-      "description": "Human-readable publisher identity for the install-time prompt. Examples: 'github:someuser', 'org:someorg', 'maccrab-rave:first-party'. Not load-bearing for verification — that's signer_public_key_sha256."
+      "description": "Human-readable publisher identity for the install-time prompt. Examples: 'github:someuser', 'org:someorg', 'maccrab-rave:first-party'. Not load-bearing for verification \u2014 that's signer_public_key_sha256."
     },
     "signer_public_key_sha256": {
       "type": "string",
@@ -139,30 +161,47 @@
     "manifest_path": {
       "type": "string",
       "const": "manifest.json",
-      "description": "Path to manifest.json inside the plugin's install directory. Fixed at v1 — the flat-directory format puts manifest.json at the top of the install dir."
+      "description": "Path to manifest.json inside the plugin's install directory. Fixed at v1 \u2014 the flat-directory format puts manifest.json at the top of the install dir."
     },
     "versions": {
       "type": "object",
       "patternProperties": {
-        "^[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9-]+)?$": { "$ref": "#/$defs/VersionEntry" }
+        "^[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9-]+)?$": {
+          "$ref": "#/$defs/VersionEntry"
+        }
       },
       "additionalProperties": false,
       "minProperties": 1
     },
     "metadata": {
       "type": "object",
-      "required": ["category", "tags", "min_maccrab_version", "min_macos"],
+      "required": [
+        "category",
+        "tags",
+        "min_maccrab_version",
+        "min_macos"
+      ],
       "additionalProperties": false,
       "properties": {
         "category": {
           "type": "string",
-          "enum": ["system", "browser", "comms", "activity", "artifact", "analyzer"],
+          "enum": [
+            "system",
+            "browser",
+            "comms",
+            "activity",
+            "artifact",
+            "analyzer"
+          ],
           "description": "Topic taxonomy. system = TCC/launchd/quarantine/codesigning-graph; browser = Safari; comms = Mail/iMessage/FaceTime; activity = KnowledgeC/Biome/AppleScript; artifact = Mach-O/DMG/PKG/plist analyzers; analyzer = posture cross-reference."
         },
         "tags": {
           "type": "array",
           "maxItems": 40,
-          "items": { "type": "string", "maxLength": 40 }
+          "items": {
+            "type": "string",
+            "maxLength": 40
+          }
         },
         "min_maccrab_version": {
           "type": "string",
@@ -175,23 +214,71 @@
         "min_macos": {
           "type": "string",
           "pattern": "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "in-hand",
+            "inventory",
+            "changed",
+            "combine"
+          ]
+        },
+        "input": {
+          "type": "string",
+          "enum": [
+            "host",
+            "selected",
+            "earlier"
+          ]
+        },
+        "companion": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$",
+          "maxLength": 80,
+          "description": "Name of a separately invoked authoring tool, never automatic collector behavior."
+        },
+        "accepts": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+\\.[a-z0-9_]+$",
+            "maxLength": 80
+          },
+          "description": "Accepted report content types. A feed exists only when another entry emits the type."
         }
       }
     },
     "status": {
       "type": "string",
-      "enum": ["active", "unreachable_temporary", "unreachable_extended", "archived", "revoked", "pre-release"],
+      "enum": [
+        "active",
+        "unreachable_temporary",
+        "unreachable_extended",
+        "archived",
+        "revoked",
+        "pre-release"
+      ],
       "default": "active",
       "description": "Plugin lifecycle status. pre-release = catalog entry exists but no published binary yet (v0.1.0 not cut)."
     },
     "kind": {
       "type": "string",
-      "enum": ["collector", "analyzer"],
+      "enum": [
+        "collector",
+        "analyzer"
+      ],
       "description": "Forensic plugin role. collector = snapshots system/app data into structured records; analyzer = cross-references already-collected records to surface patterns."
     },
     "privacy_class": {
       "type": "string",
-      "enum": ["metadata", "personal-comms", "content"],
+      "enum": [
+        "metadata",
+        "personal-comms",
+        "content"
+      ],
       "description": "Sensitivity of the plugin's emitted records. metadata = safe in plaintext scan; personal-comms = requires encrypted-scan opt-in; content = full body content, strictest opt-in."
     },
     "requires_encrypted_scan": {
@@ -201,19 +288,28 @@
     "tcc_requirements": {
       "type": "array",
       "maxItems": 32,
-      "items": { "type": "string", "maxLength": 80 },
+      "items": {
+        "type": "string",
+        "maxLength": 80
+      },
       "description": "macOS privacy services the plugin needs. Examples: 'Full Disk Access', 'Contacts', 'Automation'. Used by the install prompt + the kit How-it-works sheet."
     },
     "data_sources": {
       "type": "array",
       "maxItems": 64,
-      "items": { "type": "string", "maxLength": 256 },
+      "items": {
+        "type": "string",
+        "maxLength": 256
+      },
       "description": "Human-readable list of files/databases the plugin reads. Operator sees this before install."
     },
     "emits": {
       "type": "array",
       "maxItems": 40,
-      "items": { "type": "string", "maxLength": 80 },
+      "items": {
+        "type": "string",
+        "maxLength": 80
+      },
       "description": "Content type IDs the plugin produces. Drives platform-side tagging + the kit-aware findings display."
     },
     "sample_output": {
@@ -221,12 +317,26 @@
       "maxItems": 32,
       "items": {
         "type": "object",
-        "required": ["content_type", "example"],
+        "required": [
+          "content_type",
+          "example"
+        ],
         "additionalProperties": false,
         "properties": {
-          "content_type": { "type": "string", "maxLength": 80 },
-          "example": { "type": "string", "maxLength": 8000, "description": "One example NDJSON record this plugin emits. Pretty-printed for catalog display. Rendered as text only, never as HTML." },
-          "caption": { "type": "string", "maxLength": 200, "description": "Optional human caption for the catalog UI." }
+          "content_type": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "example": {
+            "type": "string",
+            "maxLength": 8000,
+            "description": "One example NDJSON record this plugin emits. Pretty-printed for catalog display. Rendered as text only, never as HTML."
+          },
+          "caption": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Optional human caption for the catalog UI."
+          }
         }
       },
       "description": "Plain-language samples of what the plugin's output looks like. The catalog UI renders one preview per content_type so operators can see the data shape before installing."
@@ -234,6 +344,17 @@
     "security_report_routing": {
       "type": "string",
       "format": "uri"
+    },
+    "tagline": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 90,
+      "description": "Signed plain-text investigation question or purpose; editorial target 80 characters."
+    },
+    "icon_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of the icon bytes; consumers verify before decoding."
     }
   },
   "$defs": {
@@ -250,7 +371,9 @@
       ],
       "additionalProperties": false,
       "properties": {
-        "tag": { "type": "string" },
+        "tag": {
+          "type": "string"
+        },
         "source_commit": {
           "type": "string",
           "pattern": "^[0-9a-f]{40}$"
@@ -263,7 +386,7 @@
         "canonical_tree_sha256": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$",
-          "description": "Canonical tree hash per plan §3.7 Mach-O-aware normalization recipe. Source-integrity claim."
+          "description": "Canonical tree hash per plan \u00a73.7 Mach-O-aware normalization recipe. Source-integrity claim."
         },
         "manifest_sha256": {
           "type": "string",
@@ -277,24 +400,55 @@
         },
         "vetting": {
           "type": "object",
-          "required": ["automated_passes", "vetting_policy_commit", "vetted_at"],
+          "required": [
+            "automated_passes",
+            "vetting_policy_commit",
+            "vetted_at"
+          ],
           "additionalProperties": false,
           "properties": {
             "automated_passes": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
             },
             "vetting_policy_commit": {
               "type": "string"
             },
-            "vetted_at": { "type": "string", "format": "date-time" }
+            "vetted_at": {
+              "type": "string",
+              "format": "date-time"
+            }
           }
         },
         "reproducibility": {
           "type": "string",
-          "enum": ["verified", "not_applicable"]
+          "enum": [
+            "verified",
+            "not_applicable"
+          ]
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "icon_sha256"
+        ]
+      },
+      "then": {
+        "required": [
+          "icon"
+        ],
+        "properties": {
+          "icon": {
+            "pattern": "^icons/[a-z0-9.-]+\\.[0-9a-f]{8}\\.png$"
+          }
+        }
+      }
+    }
+  ]
 }

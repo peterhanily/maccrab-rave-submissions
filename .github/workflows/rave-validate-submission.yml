@@ -22,6 +22,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 permissions:
   contents: read
   pull-requests: read
@@ -32,13 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Install jsonschema
         run: pip install jsonschema
 
       - name: Validate all catalog artifacts against their schemas
         # entries + the aggregate catalog.json + kits + revocations
-        run: python3 tools/validate-catalog-schemas
+        run: |
+          python3 tools/validate-catalog-schemas
+          python3 tools/check-submission-pins
 
       - name: Check for plugin ID collisions across catalog
         run: |
@@ -72,15 +81,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Identify catalog entries changed in this PR
         id: changed
         run: |
           # On PR: diff against base. On workflow_dispatch: scan all entries.
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode pr \
+                  --base "${{ github.event.pull_request.base.sha || github.base_ref }}")
           else
-              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode all)
           fi
           echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
           echo "files to scan:"
@@ -91,9 +104,12 @@ jobs:
           CHANGED: ${{ steps.changed.outputs.changed }}
         run: |
           set -e
+          # Unreachable: changed-catalog-entries exits non-zero on an empty
+          # result, so an empty CHANGED here means the resolver was bypassed.
+          # Refuse rather than report a stage pass over zero files.
           if [[ -z "${CHANGED}" ]]; then
-              echo "no catalog entries changed — nothing to scan"
-              exit 0
+              echo "::error::no catalog entries resolved — refusing to report a vetting pass over nothing"
+              exit 1
           fi
 
           FAIL_TOTAL=0
@@ -108,19 +124,19 @@ jobs:
               [[ -f "${ENTRY}" ]] || continue
               PLUGIN_ID=$(jq -r '.id' "${ENTRY}")
               SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
-              SOURCE_COMMIT=$(jq -r '.approved_at_commit' "${ENTRY}")
+              SOURCE_COMMIT=$(jq -r '.versions[.current_version].source_commit' "${ENTRY}")
 
               echo "==> scanning ${PLUGIN_ID} (${SOURCE_REPO}@${SOURCE_COMMIT:0:8})"
               CLONE_DIR=$(mktemp -d)
-              gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --depth=20 --no-tags
-              (cd "${CLONE_DIR}" && git checkout -q "${SOURCE_COMMIT}" 2>/dev/null || echo "warn: could not checkout ${SOURCE_COMMIT}, scanning HEAD")
+              git clone --no-checkout --no-tags "${SOURCE_REPO}" "${CLONE_DIR}"
+              (cd "${CLONE_DIR}" && git checkout --detach "${SOURCE_COMMIT}")
 
               # Pass the PR's catalog entry so the exact privacy_class <->
               # requires_encrypted_scan coupling is enforced against the source's manifest.
-              REPORT=$(python3 tools/stage2-capability-consistency.py "${CLONE_DIR}" --entry "${ENTRY}" 2>/dev/null || true)
-              FAILS=$(echo "${REPORT}" | jq -r '.fail_count // 0')
+              REPORT=$(python3 tools/stage2-capability-consistency.py "${CLONE_DIR}" --entry "${ENTRY}")
+              FAILS=$(echo "${REPORT}" | jq -er '.fail_count | select(type == "number")')
               WARNS=$(echo "${REPORT}" | jq -r '.warn_count // 0')
-              FILES=$(echo "${REPORT}" | jq -r '.swift_files_scanned // 0')
+              FILES=$(echo "${REPORT}" | jq -er '.swift_files_scanned | select(type == "number" and . > 0)')
               FAIL_TOTAL=$((FAIL_TOTAL + FAILS))
 
               echo "| ${PLUGIN_ID} | ${FILES} | ${FAILS} | ${WARNS} |" >> "${GITHUB_STEP_SUMMARY}"
@@ -150,15 +166,23 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Pin the build toolchain (fail closed on drift)
         # Reproducibility (the canonical hash compared below) is only meaningful
         # against a FIXED toolchain — an unpinned Xcode silently changes the build
-        # output and breaks every rebuild. Authors must build their submission with
-        # this same Xcode. Bump XCODE_VERSION deliberately (and re-baseline approved
-        # canonical hashes) when moving the floor; never let it float.
+        # output and breaks every rebuild. Authors MUST build their release with this
+        # exact Xcode (see docs/contributing) or Stage 3 will not reproduce their
+        # artifact. Bump XCODE_VERSION deliberately (and re-baseline approved canonical
+        # hashes) when moving the floor; never let it float.
+        #
+        # PLACEHOLDER until the contrib channel opens: confirm this version is on the
+        # runner image (the fail-closed step below prints what's available) and set it
+        # to the released Xcode contributors target, BEFORE accepting submissions.
         env:
-          XCODE_VERSION: "15.4"
+          XCODE_VERSION: "16.2"
         run: |
           set -e
           XC="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
@@ -178,9 +202,10 @@ jobs:
           # On PR: diff against base to find the submitted plugin entry. On
           # workflow_dispatch (no submission context): no-op cleanly.
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode pr \
+                  --base "${{ github.event.pull_request.base.sha || github.base_ref }}")
           else
-              CHANGED=""
+              CHANGED=$(python3 tools/changed-catalog-entries --mode all)
           fi
           echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
           echo "entries to rebuild:"
@@ -207,9 +232,12 @@ jobs:
           # failure, so `vetting-gate` stays un-green and review.js refuses the merge.
           # First-party entries are added by the owner directly and skip this gate.
           set -e
+          # Unreachable: changed-catalog-entries exits non-zero on an empty
+          # result, so an empty CHANGED here means the resolver was bypassed.
+          # Refuse rather than report a stage pass over zero files.
           if [[ -z "${CHANGED}" ]]; then
-              echo "no catalog entries changed — nothing to rebuild (workflow_dispatch no-op)"
-              exit 0
+              echo "::error::no catalog entries resolved — refusing to report a vetting pass over nothing"
+              exit 1
           fi
 
           for ENTRY in ${CHANGED}; do
@@ -233,30 +261,19 @@ jobs:
                   fi
               done
 
-              # Mode + commit resolution: a real pinned commit -> ENFORCE; an all-zero
-              # placeholder -> RECORD (resolve the commit from the release tag).
-              if [[ "${SOURCE_COMMIT}" =~ ^0+$ || "${SOURCE_COMMIT}" == "null" ]]; then
-                  MODE="record"
-                  REF=$(gh api "repos/${SLUG}/git/ref/tags/${TAG}" --jq '.object.sha + " " + .object.type' 2>/dev/null || true)
-                  RSHA="${REF% *}"; RTYPE="${REF#* }"
-                  if [[ -z "${RSHA}" ]]; then
-                      echo "::error::${PLUGIN_ID}: could not resolve tag ${TAG} in ${SLUG}"
-                      exit 1
-                  fi
-                  # annotated tag -> dereference to the commit it points at
-                  if [[ "${RTYPE}" == "tag" ]]; then
-                      RSHA=$(gh api "repos/${SLUG}/git/tags/${RSHA}" --jq '.object.sha')
-                  fi
-                  SOURCE_COMMIT="${RSHA}"
-              else
-                  MODE="enforce"
+              # The Worker resolves the tag once before opening the PR. Every
+              # stage consumes that reviewed commit; no stage falls back to HEAD.
+              if [[ ! "${SOURCE_COMMIT}" =~ ^[a-f0-9]{40}$ || "${SOURCE_COMMIT}" =~ ^0+$ ]]; then
+                  echo "::error::${PLUGIN_ID}: source_commit is not pinned"; exit 1
               fi
+              MODE="enforce"
+              [[ "${CANONICAL_SHA}" =~ ^0+$ ]] && MODE="record"
 
               echo "==> ${PLUGIN_ID} v${VERSION} (${SLUG}@${SOURCE_COMMIT:0:8}, ${TAG}, mode=${MODE})"
 
               # Clone + checkout the resolved/pinned commit (full clone -> commit present).
               CLONE_DIR=$(mktemp -d)
-              if ! gh repo clone "${SLUG}" "${CLONE_DIR}/source-rebuild"; then
+              if ! git clone --no-checkout --no-tags "https://github.com/${SLUG}.git" "${CLONE_DIR}/source-rebuild"; then
                   echo "::error::${PLUGIN_ID}: failed to clone ${SOURCE_REPO}"; exit 1
               fi
               if ! (cd "${CLONE_DIR}/source-rebuild" && git checkout "${SOURCE_COMMIT}"); then
@@ -280,7 +297,7 @@ jobs:
               # a faithfully-built signed release hashes identically to the unsigned
               # rebuild. This binds "what users download" to "what the source builds".
               DL_DIR=$(mktemp -d)
-              if ! gh release download "${TAG}" --repo "${SLUG}" --pattern '*.maccrabplugin.zip' --dir "${DL_DIR}" 2>/dev/null; then
+              if ! python3 tools/download-submission-archive "${SLUG}" "${TAG}" "${DL_DIR}"; then
                   echo "::error::${PLUGIN_ID}: could not download a *.maccrabplugin.zip asset from release ${TAG}"; exit 1
               fi
               PUBLISHED_ZIP=$(find "${DL_DIR}" -name '*.maccrabplugin.zip' | head -1)
@@ -323,6 +340,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Stage 4a — author-supplied fixtures (signal of intent)
         run: |
@@ -330,28 +350,32 @@ jobs:
           # Each must fail inside Tier B containment. Authors who can't articulate
           # what their plugin shouldn't be able to do are surfaced for manual review.
           # Per plan §4.4 — author fixtures are signal-of-intent, NOT the load-bearing
-          # check; Stage 4b below is the actual assessment.
+          # check; Stage 4b remains closed until exact-release qualification is integrated.
 
           set -e
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode pr \
+                  --base "${{ github.event.pull_request.base.sha || github.base_ref }}")
           else
-              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode all)
           fi
 
+          # Unreachable: changed-catalog-entries exits non-zero on an empty
+          # result, so an empty CHANGED here means the resolver was bypassed.
+          # Refuse rather than report a stage pass over zero files.
           if [[ -z "${CHANGED}" ]]; then
-              echo "no catalog entries changed — skipping stage-4a"
-              exit 0
+              echo "::error::no catalog entries resolved — refusing to report a vetting pass over nothing"
+              exit 1
           fi
 
           FAIL_TOTAL=0
           for ENTRY in ${CHANGED}; do
               [[ -f "${ENTRY}" ]] || continue
               SOURCE_REPO=$(jq -r '.source_repo' "${ENTRY}")
-              SOURCE_COMMIT=$(jq -r '.approved_at_commit' "${ENTRY}")
+              SOURCE_COMMIT=$(jq -r '.versions[.current_version].source_commit' "${ENTRY}")
               CLONE_DIR=$(mktemp -d)
-              gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --depth=20 --no-tags
-              (cd "${CLONE_DIR}" && git checkout -q "${SOURCE_COMMIT}" 2>/dev/null || true)
+              git clone --no-checkout --no-tags "${SOURCE_REPO}" "${CLONE_DIR}"
+              (cd "${CLONE_DIR}" && git checkout --detach "${SOURCE_COMMIT}")
 
               if [[ ! -d "${CLONE_DIR}/Tests/adversarial" ]]; then
                   echo "::warning::author plugin has no Tests/adversarial/ — flag for manual review (plan §4.4 Stage 4a)"
@@ -365,52 +389,14 @@ jobs:
               echo "stage-4a: author provided ${FIXTURE_COUNT} fixtures for $(jq -r '.id' ${ENTRY})"
           done
 
-      - name: Stage 4b — rave-supplied adversarial fixtures (load-bearing check)
+      - name: Stage 4b — require reviewed qualification of the exact native release
+        # Qualification is produced separately on the signed/notarized host.
+        # Missing evidence refuses publication. This job never substitutes the
+        # retired prototype, source fixtures, or a guessed native version.
         run: |
-          # The canonical Stage 4b corpus is at vetting/adversarial-fixtures/.
-          # The harness binary currently lives at rave-prototypes/prototype-contained-plugin/
-          # for historical reasons; moves into vetting/adversarial-fixtures/harness/
-          # at the plugin-template repo split per docs/runbooks/plugin-template-split.md.
-
-          set -e
-
-          # Sanity-check the canonical SBPL profile is present.
-          if [[ ! -f vetting/adversarial-fixtures/tier-b-base.sb ]]; then
-              echo "::error::canonical Tier B SBPL profile missing at vetting/adversarial-fixtures/tier-b-base.sb"
-              exit 1
-          fi
-
-          # Build the harness + run the fixture corpus. Variant B (sandbox-exec
-          # + Hardened Runtime) is the v0 production containment per plan §3.4 v4.4
-          # and must pass 10/10. Variant A (App Sandbox) is run for comparison /
-          # documentation; its 7/10 is expected and not a failure of this job.
-          cd rave-prototypes/prototype-contained-plugin
-          ./scripts/build-and-sign.sh > /dev/null
-          ./scripts/build-no-app-sandbox.sh > /dev/null
-
-          # Replace the prototype's SBPL profile with the canonical one so this
-          # run actually tests rave's canonical profile, not a possibly-drifted copy.
-          cp ../../vetting/adversarial-fixtures/tier-b-base.sb sbpl/tier-b-base.sb
-
-          # Run the layered comparison; capture the result.
-          set +e
-          ./scripts/run-fixtures-layered.sh
-          RESULT=$?
-          set -e
-
-          if [[ "${RESULT}" -ne 0 ]]; then
-              echo "::error::Stage 4b: Variant B (sandbox-exec custom profile) did not pass all fixtures — Tier B containment is weaker than the plan asserts"
-              exit 1
-          fi
-
-          {
-              echo "## Stage 4b — containment validation"
-              echo "- Tier B SBPL profile: \`vetting/adversarial-fixtures/tier-b-base.sb\`"
-              echo "- Variant B (canonical v0 model): **10/10 fixtures passed**"
-              echo "- Plan §3.4 v4.4 containment model confirmed"
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-          echo "stage-4b passed (10/10 Variant B fixtures)"
+          python3 tools/check-community-native-qualification vetting/native-qualification.json
+          echo "::error::Reviewed receipt prepared, but the exact-release native qualification gate is not integrated. Community publication remains closed."
+          exit 1
 
   stage-5-reputation-and-diff:
     name: Stage 5 — reputation + diff analysis
@@ -419,7 +405,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0   # Stage 5b needs the prior approved version's catalog entry from git history
+          # Stage 5b also needs the prior approved version's entry from history.
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Stage 5a — author reputation
         env:
@@ -439,14 +427,18 @@ jobs:
 
           set -e
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode pr \
+                  --base "${{ github.event.pull_request.base.sha || github.base_ref }}")
           else
-              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode all)
           fi
 
+          # Unreachable: changed-catalog-entries exits non-zero on an empty
+          # result, so an empty CHANGED here means the resolver was bypassed.
+          # Refuse rather than report a stage pass over zero files.
           if [[ -z "${CHANGED}" ]]; then
-              echo "no catalog entries changed — skipping stage-5a"
-              exit 0
+              echo "::error::no catalog entries resolved — refusing to report a vetting pass over nothing"
+              exit 1
           fi
 
           # Resolve the REAL human submitter — NOT github.event.pull_request.user.login
@@ -468,14 +460,23 @@ jobs:
           fi
           ABUSIVE_LIST="vetting/abusive-accounts.txt"
 
-          if [[ -f "${ABUSIVE_LIST}" ]] && grep -q "^${PR_AUTHOR}$" "${ABUSIVE_LIST}"; then
+          if [[ ! -f "${ABUSIVE_LIST}" || ! -r "${ABUSIVE_LIST}" ]]; then
+              echo "::error::required abusive-accounts list is missing or unreadable"
+              exit 1
+          fi
+          if grep -Fxq -- "${PR_AUTHOR}" "${ABUSIVE_LIST}"; then
               echo "::error::PR author ${PR_AUTHOR} is on the abusive-accounts list"
               exit 1
           fi
 
           # Account age via gh api
           CREATED_AT=$(gh api "users/${PR_AUTHOR}" --jq '.created_at')
-          AGE_DAYS=$(( ( $(date +%s) - $(date -j -f "%Y-%m-%dT%H:%M:%SZ" "${CREATED_AT}" +%s) ) / 86400 ))
+          # GNU date: this stage runs on ubuntu-latest, where BSD's -j/-f do not
+          # exist. An unparseable timestamp must fail the step, not silently
+          # produce an age that a reputation check then trusts.
+          CREATED_EPOCH=$(date -u -d "${CREATED_AT}" +%s) || {
+              echo "::error::could not parse account creation time '${CREATED_AT}'"; exit 1; }
+          AGE_DAYS=$(( ( $(date -u +%s) - CREATED_EPOCH ) / 86400 ))
           if [[ "${AGE_DAYS}" -lt 30 ]]; then
               echo "::error::PR author ${PR_AUTHOR} account is ${AGE_DAYS} days old (policy threshold: 30)"
               exit 1
@@ -484,7 +485,8 @@ jobs:
           # Prior commit history check — count public commits in last 12 months
           # outside the plugin repos. This is a proxy; production may use a
           # more refined query.
-          PRIOR_COMMITS=$(gh api "search/commits?q=author:${PR_AUTHOR}+committer-date:>$(date -j -v-12m +%Y-%m-%d)" --jq '.total_count' 2>/dev/null || echo "0")
+          SINCE=$(date -u -d "12 months ago" +%Y-%m-%d)
+          PRIOR_COMMITS=$(gh api "search/commits?q=author:${PR_AUTHOR}+committer-date:>${SINCE}" --jq '.total_count' 2>/dev/null || echo "0")
           if [[ "${PRIOR_COMMITS}" -lt 5 ]]; then
               echo "::warning::PR author ${PR_AUTHOR} has only ${PRIOR_COMMITS} prior commits in last 12mo (policy preference: ≥5); flag for maintainer judgment"
           fi
@@ -502,13 +504,17 @@ jobs:
 
           set -e
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-              CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode pr \
+                  --base "${{ github.event.pull_request.base.sha || github.base_ref }}")
           else
-              CHANGED=$(ls catalog/*.json 2>/dev/null || true)
+              CHANGED=$(python3 tools/changed-catalog-entries --mode all)
           fi
+          # Unreachable: changed-catalog-entries exits non-zero on an empty
+          # result, so an empty CHANGED here means the resolver was bypassed.
+          # Refuse rather than report a stage pass over zero files.
           if [[ -z "${CHANGED}" ]]; then
-              echo "no catalog entries changed — skipping stage-5b"
-              exit 0
+              echo "::error::no catalog entries resolved — refusing to report a vetting pass over nothing"
+              exit 1
           fi
 
           FLAG_TOTAL=0
@@ -548,7 +554,7 @@ jobs:
               LOC_DELTA="(unknown)"
               if [[ "${OLD_COMMIT}" != "${NEW_COMMIT}" && "${OLD_COMMIT}" != "null" && "${NEW_COMMIT}" != "null" ]]; then
                   CLONE_DIR=$(mktemp -d)
-                  gh repo clone "${SOURCE_REPO#https://github.com/}" "${CLONE_DIR}" -- --no-tags 2>/dev/null || true
+                  git clone --no-checkout --no-tags "${SOURCE_REPO}" "${CLONE_DIR}" 2>/dev/null || true
                   if [[ -d "${CLONE_DIR}/.git" ]]; then
                       LOC_DELTA=$( (cd "${CLONE_DIR}" && git diff --stat "${OLD_COMMIT}" "${NEW_COMMIT}" 2>/dev/null | tail -1 | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo "0") )
                   fi
@@ -593,7 +599,7 @@ jobs:
                   echo "::warning::${PLUGIN_ID}: source diff is ${LOC_DELTA} LOC (auto-merge threshold: 1000)"
               fi
 
-              VERDICT="auto-merge-eligible"
+              VERDICT="owner-review-required"
               [[ "${CAP_DELTA}" -gt 0 || "${SIG_CHANGE}" == "**YES**" || "${RED_FLAGS}" -gt 0 || "${LOC_DELTA}" -gt 1000 ]] && VERDICT="manual-review-required"
 
               echo "| ${PLUGIN_ID} | ${CAP_DELTA} lines | ${LOC_DELTA}${LOC_FLAG} | ${SIG_CHANGE} | ${RED_FLAGS} | ${VERDICT} |" >> "${GITHUB_STEP_SUMMARY}"
@@ -603,9 +609,9 @@ jobs:
               echo
               echo "stage-5b: ${FLAG_TOTAL} flag(s) — auto-merge NOT eligible; manual review required"
               # Per plan §4.6, flags don't fail vetting outright — they require manual review
-              # The merging tool reads this verdict and chooses auto-merge vs flag-for-review
+              # The owner reads these flags alongside the source; nothing auto-merges
           else
-              echo "stage-5b: no flags; auto-merge eligible per plan §4.6 policy"
+              echo "stage-5b: no flags; owner review and offline signing are still required"
           fi
 
   stage-6-ai-assisted-review:
@@ -620,6 +626,9 @@ jobs:
     if: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the base commit must be present, or changed-entry detection cannot run
 
       - name: Sanitize source for prompt injection
         run: |
@@ -676,4 +685,4 @@ jobs:
       - stage-4-containment-validation
       - stage-5-reputation-and-diff
     steps:
-      - run: echo "all load-bearing vetting stages passed — vetting-gate is green"
+      - run: echo "all load-bearing vetting stages passed — owner review and signing still required"
