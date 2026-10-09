@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Check reviewed release-qualification receipts, without executing any plugin.
+
+This checks evidence binding only. Producing/reviewing the containment corpus and
+independent review remains a release-owner task on the exact signed native host.
+An absent receipt deliberately keeps the community vetting gate closed.
+"""
+import argparse
+import hashlib
+import json
+import re
+from pathlib import Path
+
+
+def validate(path):
+    record = json.loads(path.read_text())
+    if record.get("format") != "rave-community-native-qualification/1":
+        raise ValueError("unsupported qualification receipt")
+    if not re.fullmatch(r"[a-f0-9]{64}", record.get("native_archive_sha256", "")) or record["native_archive_sha256"] == "0" * 64:
+        raise ValueError("exact signed/notarized native archive digest required")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", record.get("native_version", "")):
+        raise ValueError("native release version required")
+    if not record.get("reviewed_by") or not record.get("reviewed_at"):
+        raise ValueError("owner review is not recorded")
+    for name in ("containment", "independent_review"):
+        item = record.get(name, {})
+        if item.get("status") != "passed" or item.get("native_archive_sha256") != record["native_archive_sha256"]:
+            raise ValueError(f"{name} does not qualify the same native release")
+        relative = Path(item.get("report", ""))
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError(f"{name} report must be a local relative path")
+        report = path.parent / relative
+        if report.is_symlink() or not report.is_file() or not report.resolve().is_relative_to(path.parent.resolve()):
+            raise ValueError(f"{name} report is absent or outside the evidence directory")
+        if hashlib.sha256(report.read_bytes()).hexdigest() != item.get("report_sha256"):
+            raise ValueError(f"{name} report digest differs from the reviewed receipt")
+    return record
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("receipt", type=Path)
+    args = parser.parse_args()
+    try:
+        record = validate(args.receipt)
+    except (OSError, ValueError, TypeError) as exc:
+        parser.exit(1, f"error: community release qualification is incomplete: {exc}\n")
+    print(f"reviewed native qualification evidence bound to {record['native_version']} / {record['native_archive_sha256']}")

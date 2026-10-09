@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""changed-catalog-entries — resolve WHICH catalog entries a vetting run must inspect.
+
+Every vetting stage used to inline this:
+
+    CHANGED=$(git diff --name-only "${GITHUB_BASE_REF:-origin/main}" -- 'catalog/*.json' || true)
+
+which fails open three ways at once, and did so in four of the five stages:
+
+  1. `actions/checkout` is shallow by default, so the base commit is absent and
+     the diff errors out;
+  2. `|| true` swallows that error, leaving CHANGED empty;
+  3. the caller reads empty as "nothing changed — nothing to scan" and exits 0.
+
+The net effect is a submission PR passing a stage that inspected no files at all.
+`GITHUB_BASE_REF` is also a branch NAME, not a resolvable local ref, so the diff
+was wrong even with full history.
+
+This tool fails CLOSED instead. A diff that cannot run is an error, and in
+pull_request mode an empty result is an error too: the workflow's own path
+filter is `catalog/**`, so a PR that reaches it has changed a catalog entry by
+construction. Nothing changed means the detection broke, not that there is
+nothing to look at.
+
+Usage:
+  changed-catalog-entries --mode pr  --base <sha-or-ref> [--head <sha-or-ref>]
+  changed-catalog-entries --mode all
+Prints one path per line on stdout; diagnostics go to stderr.
+"""
+import argparse
+import glob
+import os
+import subprocess
+import sys
+
+
+def die(message):
+    print(f"::error::changed-catalog-entries: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def git(*args):
+    """Run git, raising with git's own stderr rather than swallowing it."""
+    done = subprocess.run(["git", *args], capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed ({done.returncode}): {done.stderr.strip()}")
+    return done.stdout
+
+
+def resolve(ref):
+    """A commit-ish that exists locally, or None. Tries the ref, then origin/<ref>,
+    because GITHUB_BASE_REF is a branch name and only the remote-tracking form is
+    present in a fetched checkout."""
+    for candidate in (ref, f"origin/{ref}"):
+        try:
+            return git("rev-parse", "--verify", f"{candidate}^{{commit}}").strip()
+        except RuntimeError:
+            continue
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["pr", "all"], required=True)
+    parser.add_argument("--base", help="base sha or branch name (pr mode)")
+    parser.add_argument("--head", default="HEAD")
+    parser.add_argument("--repo-root", default=".")
+    args = parser.parse_args()
+
+    os.chdir(args.repo_root)
+
+    if args.mode == "all":
+        entries = sorted(glob.glob("catalog/*.json"))
+        if not entries:
+            die("no catalog/*.json entries found to scan")
+        print("\n".join(entries))
+        return
+
+    if not args.base:
+        die("--base is required in pr mode")
+
+    base = resolve(args.base)
+    if base is None:
+        die(f"base revision '{args.base}' is not present in this checkout. "
+            f"The vetting stages need actions/checkout with fetch-depth: 0 — a shallow "
+            f"clone cannot diff against the base, and a swallowed diff error is how a "
+            f"stage ends up scanning nothing.")
+
+    head = resolve(args.head)
+    if head is None:
+        die(f"head revision '{args.head}' is not present in this checkout")
+
+    try:
+        # Three dots: changes introduced BY this branch, against the merge base —
+        # not every change that has landed on the base since it forked.
+        out = git("diff", "--name-only", f"{base}...{head}", "--", "catalog/*.json")
+    except RuntimeError as exc:
+        die(str(exc))
+
+    entries = [line for line in out.splitlines() if line.strip()]
+    if not entries:
+        die(f"no catalog entry changed between {args.base} and {args.head}. This workflow "
+            f"only runs on PRs touching catalog/**, so an empty result means the change "
+            f"detection failed, not that there is nothing to vet. Refusing to report a "
+            f"vetting pass over zero files.")
+    print("\n".join(entries))
+
+
+if __name__ == "__main__":
+    main()

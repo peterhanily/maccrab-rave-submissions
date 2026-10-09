@@ -41,6 +41,11 @@
       "enum": ["collector", "analyzer"],
       "description": "Forensic plugin role. collector = snapshots system/app data into structured records; analyzer = cross-references already-collected records to surface patterns. Optional (kind-less v1 manifests still validate); mirrors catalog-entry.json. The app dispatches collectors to the Tier-B IPC runner (TierBIPC, protocolVersion 1); analyzer execution is deferred."
     },
+    "privacyClass": {
+      "type": "string",
+      "enum": ["metadata", "content", "personalComms", "credentialAdjacent", "secret"],
+      "description": "Optional output sensitivity declaration supported by TierBManifest. Non-metadata results require an encrypted scan. Capability-derived sensitivity can raise this declaration."
+    },
     "fileReadSubpaths": {
       "type": "array",
       "items": {
